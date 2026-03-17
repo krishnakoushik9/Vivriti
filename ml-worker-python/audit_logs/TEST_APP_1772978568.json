@@ -1,0 +1,11 @@
+{
+  "audit_id": "c2573963f809628e60711d1da7319c64d07deecbad5184bf6f992eabb300c0fa",
+  "application_id": "TEST_APP",
+  "event": "DOCUMENT_INGESTED",
+  "timestamp": "2026-03-08T14:02:48.827247+00:00",
+  "payload": {
+    "file_name": "balance_sheet.pdf",
+    "doc_type": "balance_sheet",
+    "confidence": 0.545
+  }
+}

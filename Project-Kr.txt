@@ -1,0 +1,546 @@
+TECHNICAL AUDIT REPORT — Vivriti Hackathon (IIT Hyderabad)
+Repository: /home/krsna/Desktop/IITH-vivriti
+Date: 2026-03-17
+Role lens: Senior AI systems architect + fintech platform engineer + hackathon judge
+
+Scope note (what I actually audited)
+- This repo contains large generated artifacts (`ml-worker-python/venv/`, `bff-node/node_modules/`, `frontend-nextjs/.next/`, `core-backend-java/target/`, `logs/`). Those are not treated as “implementation”.
+- The audit is based on the source components:
+  - Java core backend: `core-backend-java/src/main/java/**`, config `core-backend-java/src/main/resources/application.yml`
+  - Python ML worker: `ml-worker-python/*.py`, `ml-worker-python/requirements.txt`
+  - Node BFF: `bff-node/server.js`, `bff-node/package.json`
+  - Next.js frontend: `frontend-nextjs/app/**`, `frontend-nextjs/components/**`, `frontend-nextjs/hooks/**`, `frontend-nextjs/lib/**`
+  - Runtime wiring: `docker-compose.yml`, `start.sh`, `run_system.sh`, `stop.sh`
+
+============================================================
+SECTION 1 — System Architecture
+============================================================
+
+### 1.1 Overall architecture (what is actually built)
+
+This is a 4-tier “demo-grade” distributed system with real-time UX:
+
+1) Frontend (Next.js) — user dashboard for credit officers
+   - Selects a mock application, accepts “credit officer notes”, triggers analysis, renders CAM.
+   - Files: `frontend-nextjs/app/page.tsx`, `frontend-nextjs/components/ApplicationDetail.tsx`, `frontend-nextjs/lib/api.ts`, `frontend-nextjs/hooks/useSocket.ts`
+
+2) BFF (Node.js + Express + Socket.io) — real-time gateway + proxy
+   - Proxies dashboard API calls to the Java backend.
+   - Receives internal progress events from Java and broadcasts to clients via WebSockets (Socket.io rooms).
+   - Files: `bff-node/server.js`
+
+3) Core backend (Java Spring Boot) — system of record + orchestration + deterministic policy engine
+   - Stores loan applications + audit logs (JPA + H2 in-memory).
+   - Provides REST API under `/api/v1/**` for listing apps, ingesting mock data, triggering analysis, and reading audit logs.
+   - Orchestrates the async pipeline: builds ML payload → calls Python worker → persists outputs → applies deterministic “pricing matrix” → notifies BFF.
+   - Files: `core-backend-java/src/main/java/com/vivriti/intellicredit/controller/LoanApplicationController.java`,
+            `core-backend-java/src/main/java/com/vivriti/intellicredit/service/OrchestrationService.java`,
+            `core-backend-java/src/main/java/com/vivriti/intellicredit/service/PricingMatrixService.java`,
+            entities `core-backend-java/src/main/java/com/vivriti/intellicredit/entity/*.java`,
+            config `core-backend-java/src/main/resources/application.yml`
+
+4) ML worker (Python FastAPI) — scoring + explainability + CAM synthesis + (separate) document parsing utilities
+   - `/analyze`: runs:
+     - RandomForestClassifier-based “creditworthiness” score trained on synthetic data
+     - IsolationForest anomaly + deterministic circular trading heuristics
+     - Lexicon NLP sentiment adjustment (notes + “news” text)
+     - Secondary research (currently mocked in `research_agent.py`)
+     - CAM generation using Gemini if configured, otherwise fallback deterministic Markdown CAM
+     - SHAP/feature-importance explanation for model transparency
+   - Also exposes:
+     - `/api/v1/applications/{application_id}/upload-document` (PDF-only) → `document_ai.process_document`
+     - `/api/v1/applications/{application_id}/export-cam` → PDF/DOCX export via `cam_exporter.py`
+   - Files: `ml-worker-python/main.py`, `ml-worker-python/document_ai.py`, `ml-worker-python/research_agent.py`,
+            `ml-worker-python/explainability.py`, `ml-worker-python/cam_exporter.py`
+
+### 1.2 Backend framework, AI models, pipelines
+
+Java backend:
+- Framework: Spring Boot 3.2.3 (`core-backend-java/pom.xml`)
+- REST endpoints: `LoanApplicationController.java` under `/api/v1`
+- Async pipeline: `@Async` orchestrator in `OrchestrationService.java` (no external queue/bus)
+- Storage: H2 in-memory DB (demo) configured in `core-backend-java/src/main/resources/application.yml`
+- Decisioning: deterministic tiering rules in `PricingMatrixService.java` (Approve/Conditional/Reject with fixed limit/rate)
+- Audit trail: immutable `AuditLog` entity + AES-GCM encryption utility for payload-at-rest (but with hardcoded key)
+  - `AuditService.java`, `AuditLog.java`, `AesEncryptionUtil.java`
+
+Python ML worker:
+- Framework: FastAPI (`ml-worker-python/main.py`)
+- Model 1: RandomForestClassifier within sklearn Pipeline (StandardScaler + RF)
+  - Trains on generated synthetic “CMIE Prowess proxy” dataset in `RandomForestCreditScorer._generate_training_dataset`
+  - Exposes retrain: `/model/retrain`
+- Model 2: IsolationForest anomaly detector + rule-based circular trading signals
+  - `IsolationForestAnomalyDetector.detect` in `main.py`
+- Model 3: NLP sentiment: keyword lexicon; adjusts score by sentiment*8
+  - `NLPSentimentAnalyzer` in `main.py`
+- Model 4: LLM CAM generator: Google Gemini
+  - `generate_cam_with_gemini` in `main.py`
+  - Note: code uses model id `"gemini-2.0-flash-exp"` though comments claim “2.5 Flash”
+- Explainability: SHAP TreeExplainer if installed, else feature-importance narrative
+  - `ml-worker-python/explainability.py`
+
+### 1.3 Database
+- Java core backend uses **H2 in-memory**:
+  - `spring.datasource.url: jdbc:h2:mem:intellicreditdb...` in `core-backend-java/src/main/resources/application.yml`
+  - Entity: `LoanApplication.java` (apps), `AuditLog.java` (audit)
+- There is no persistent DB (Postgres/MySQL) or migration tool (Flyway/Liquibase) in the audited sources.
+
+### 1.4 APIs and inter-service communication
+
+Frontend → BFF:
+- HTTP via axios in `frontend-nextjs/lib/api.ts` to:
+  - `GET /api/applications`
+  - `GET /api/applications/:id`
+  - `POST /api/applications/ingest-all`
+  - `POST /api/applications/:id/analyze`
+  - `GET /api/applications/:id/audit`
+- WebSockets via socket.io in `frontend-nextjs/hooks/useSocket.ts`
+
+BFF → Java:
+- Proxies REST calls to `JAVA_BACKEND_URL` in `bff-node/server.js`
+
+Java → Python:
+- `POST {pythonWorkerUrl}/analyze` with a generated “service token” in `OrchestrationService.callPythonWorker`
+
+Java → BFF (progress events):
+- `POST {bffNodeUrl}/internal/progress` in `OrchestrationService.notifyBff`
+- BFF emits `progress:update`, then fetches final app state from Java and emits `analysis:complete` (see `bff-node/server.js`)
+
+### 1.5 Frontend flow (what the demo actually shows)
+- Credit officer clicks “Ingest from Databricks” → triggers Java `/api/v1/applications/ingest-all` via BFF proxy
+  - UI: `frontend-nextjs/app/page.tsx`
+  - Backend: `LoanApplicationController.ingestAll`, `DatabricksIngestionService` (mock)
+- Officer selects an application, enters notes, clicks “Generate Credit Intelligence & CAM”
+  - UI: `ApplicationDetail.tsx` triggers `intelliCreditApi.triggerAnalysis` (BFF→Java)
+  - Java starts async orchestration and pushes progress updates to BFF → UI shows pipeline stepper
+- When completed, UI renders:
+  - ML score gauge
+  - Anomaly/circular trading flags from `LoanApplication.anomalyDetails`
+  - “Web intelligence summary” from `LoanApplication.newsIntelligenceSummary`
+  - CAM markdown in `LoanApplication.camDocument`
+
+### 1.6 Simple architecture diagram description
+
+Diagram (text form):
+
+  [Next.js Dashboard]
+     |  HTTP (axios) + WS (socket.io)
+     v
+  [Node BFF / Proxy + Socket.io]
+     |  HTTP proxy
+     v
+  [Java Core Backend: Spring Boot]
+     |  POST /analyze (service JWT)
+     v
+  [Python ML Worker: FastAPI]
+
+Progress path:
+  Java -> POST /internal/progress -> BFF -> WS progress:update -> Frontend
+
+Data persistence:
+  Java persists LoanApplication + AuditLog in H2 (in-memory)
+
+============================================================
+SECTION 2 — Feature Mapping to Hackathon Requirements
+============================================================
+
+Legend:
+- “Implemented?” is judged against the hackathon statement (“must support”) not merely “a placeholder exists”.
+
+| Hackathon Requirement | Implemented? | Where in Code | Notes |
+|---|---:|---|---|
+| Pillar 1: Parse messy Indian-context PDFs | PARTIAL | `ml-worker-python/document_ai.py`, API `POST /api/v1/applications/{id}/upload-document` in `ml-worker-python/main.py` | PDF text extraction via PyMuPDF / pdfplumber and keyword doc classification exists. Not integrated into the core pipeline (Java orchestration never calls this). No “messy PDF robustness” evaluation, no layout models, no line-item normalization, no confidence-driven human validation loop. |
+| Extract financial data: annual reports | PARTIAL | `document_ai.py` classification `annual_report`, but parsing is generic summary | Only classifies; does not reliably extract annual report financials beyond basic text/table heuristics. |
+| Extract financial data: financial statements | PARTIAL | `document_ai.py` → `parse_balance_sheet`, `parse_income_statement` | Heuristic parsing exists; table extraction uses pdfplumber `extract_tables()`, but there is no reconciliation across years/columns, no units normalization (₹, lakhs/crores) beyond some regex context, and no validation against totals. |
+| Extract financial data: legal notices | PARTIAL | `document_ai.py` classification `legal_document` | Classification only; no real legal entity extraction, case metadata parsing, or risk scoring. |
+| Extract financial data: bank sanction letters | NOT IMPLEMENTED | (none) | No signature class for sanction letters; no schema for terms (limit, covenants, collateral, rate, tenure) extraction. |
+| Work with structured inputs: GST filings | PARTIAL (mock + heuristic) | `document_ai.py` → `parse_gst_return`; `research_agent.py` → `analyze_gst_reconciliation` (mocked) | There is a parser stub for GST returns from PDF text. The “reconciliation/anomaly” is randomized mock in `research_agent.py`; not tied to actual GST data. Java `LoanApplication.gstComplianceScore` is ingested from mock Databricks, not from GST filings. |
+| Work with structured inputs: ITRs | NOT IMPLEMENTED | (none) | No ITR parser or schema. |
+| Work with structured inputs: bank statements | PARTIAL | `document_ai.py` → `parse_bank_statement` | Only basic opening/closing balance and table row count; no transaction categorization, cashflow seasonality, EMI/bounce detection beyond simple regex, no “bank statement -> cashflow” model. Not wired into risk pipeline. |
+| Detect anomalies: circular trading | PARTIAL | `ml-worker-python/main.py` `IsolationForestAnomalyDetector.detect` + rule signals CT-1..CT-4 | Detection is based on numeric features (growth, GST score, ICR, D/E) coming from Java ingestion (mock) and not cross-validated against documents or real counterparty graphs. Still useful for demo narratives. |
+| Detect anomalies: revenue inflation | PARTIAL (mock) | `research_agent.py` `analyze_gst_reconciliation` | Randomized mismatch; not computed from actual GST returns or bank statement inflows. |
+| Pillar 2: Crawl web for news about company/promoters | NOT IMPLEMENTED (mock) | `ml-worker-python/research_agent.py` `search_company_news` | Returns hardcoded strings by keyword; no actual crawling, no source citations, no de-dup, no time filtering. |
+| Crawl sector regulations | NOT IMPLEMENTED | (none) | No SEBI/RBI circular ingestion, no sector policy knowledge base. |
+| Crawl litigation | NOT IMPLEMENTED (mock) | `research_agent.py` `search_ecourts_litigation` | Hardcoded litigation hits; no eCourts/NCLT scraping, no case metadata. |
+| Access Indian sources: MCA filings | NOT IMPLEMENTED (mock) | `research_agent.py` `check_mca_filings` | Hardcoded; no MCA API integration, no CIN lookup, no filings timeline. |
+| Access Indian sources: eCourts | NOT IMPLEMENTED (mock) | `research_agent.py` `search_ecourts_litigation` | Hardcoded; no real search. |
+| Accept qualitative input from credit officer | IMPLEMENTED | UI `ApplicationDetail.tsx` textarea; Java `LoanApplication.creditOfficerNotes`; pipeline payload in `OrchestrationService.buildMlPayload` | Notes are stored and forwarded to ML worker. |
+| Integrate qualitative insight into risk score | IMPLEMENTED (simple) | `ml-worker-python/main.py` `NLPSentimentAnalyzer.analyze` + score adjustment | Keyword lexicon sentiment adjusts score. No calibration or explainable mapping for regulators; still demonstrable. |
+| Pillar 3: Generate structured CAM | IMPLEMENTED | `ml-worker-python/main.py` `generate_cam_with_gemini` + `generate_fallback_cam`; stored in Java `LoanApplication.camDocument` | CAM is Markdown. Export utilities exist on Python side (`cam_exporter.py`) but frontend exports only `.md` and print. |
+| CAM follows Five Cs of Credit | IMPLEMENTED | Gemini prompt in `main.py` includes Five Cs headings; fallback CAM includes Five Cs sections | Prompt explicitly demands Five Cs. Fallback CAM sections are present. |
+| Provide loan recommendation: amount + interest rate | IMPLEMENTED (deterministic tiers) | `PricingMatrixService.java` | Fixed tiers: ₹50L@12%, ₹25L@15%, else reject. This is simplistic but “complete” for demo. |
+| Explainable decision logic | PARTIAL | Explainability in `ml-worker-python/explainability.py`; pricing rationale in `PricingMatrixService.java`; anomaly signals in `main.py` | SHAP narrative exists but is not surfaced in UI/Java model. Deterministic policy is explainable. End-to-end “why this amount/rate” is mostly hardcoded tiers. |
+| Extraction accuracy from messy PDFs | NOT DEMONSTRATED | `document_ai.py` exists but not evaluated | No tests, gold dataset, metrics, or UI showing extracted line items with review. |
+| Research depth using external data | NOT MET | `research_agent.py` is mocked | No real external data sources. |
+| Indian financial context awareness | PARTIAL | India-specific heuristics and labels in `main.py` prompt + GST/CIBIL placeholders | India context is mostly narrative and mock data, not grounded data integration. |
+
+============================================================
+SECTION 3 — Missing Capabilities (critical gaps)
+============================================================
+
+Below are “must-have” capabilities for the Intelli‑Credit Challenge that are missing or not end-to-end.
+Each item includes: (1) why required, (2) where to implement, (3) difficulty for 24–48h hackathon.
+
+### 3.1 End-to-end document ingestion pipeline (PDF → structured fields → model features)
+1) Why required
+   - Pillar 1 explicitly requires parsing messy PDFs (annual reports, statements, notices, sanction letters).
+   - Today, the system’s “financials” used for scoring come from a mock catalog (`DatabricksIngestionService.java`), not from documents.
+2) Where to implement
+   - Make Java orchestration call Python document ingestion first, then persist extracted fields into `LoanApplication`.
+   - Integrate `ml-worker-python/document_ai.py` output with the ML feature payload.
+3) Difficulty
+   - Medium (24–48h feasible) because basic PDF parsing exists already; wiring + minimal UI review + persistence is the main work.
+
+### 3.2 OCR for scanned PDFs (image-only annual reports, legal notices)
+1) Why required
+   - Indian filings frequently contain scanned pages; pure text extraction (`fitz.get_text`, `pdfplumber.extract_text`) fails.
+2) Where to implement
+   - `ml-worker-python/document_ai.py`: detect low text density / image-only pages, run OCR, then feed downstream parsers.
+3) Difficulty
+   - Medium–High (depending on OCR choice). A minimal OCR fallback is feasible in 24–48h.
+
+### 3.3 Bank statement parsing depth (cashflow, bounces, EMI, counterparties)
+1) Why required
+   - Capacity + Character (repayment behavior) needs bank transaction behavior: bounces, overdraft usage, large round-trips, related-party flows.
+2) Where to implement
+   - Expand `document_ai.parse_bank_statement` to produce transactions, monthly summaries, and risk flags; store back to Java (new table or JSON).
+3) Difficulty
+   - Medium (CSV/Excel statements easier than PDFs; PDF bank statements vary heavily).
+
+### 3.4 GST filings reconciliation grounded in real data (not randomized)
+1) Why required
+   - Hackathon explicitly calls out circular trading/revenue inflation detection; GST vs bank inflows is central in India.
+2) Where to implement
+   - Replace `research_agent.analyze_gst_reconciliation` randomness with deterministic calculations using extracted GST return values and bank credits.
+3) Difficulty
+   - Medium if you restrict supported formats and show a clear reconciliation chart.
+
+### 3.5 Web-scale research agent (real crawling + citations + Indian sources)
+1) Why required
+   - Pillar 2 is a major scoring differentiator for judges; mock news will be called out immediately.
+2) Where to implement
+   - Implement in `ml-worker-python/research_agent.py`:
+     - Search → fetch → extract → rank → summarize with citations
+     - Add MCA/eCourts/NCLT stubs with at least one real accessible source integration (even if partial).
+3) Difficulty
+   - Medium–High. A credible “minimum viable research” with citations is feasible in 24–48h using existing APIs.
+
+### 3.6 Explainability surfaced to the user (not just computed)
+1) Why required
+   - Judges want “explainable AI reasoning”. Currently SHAP output is returned by Python but is never stored in Java or shown in the UI.
+2) Where to implement
+   - Extend Java `LoanApplication` (or separate table) to store `shap_explanation` and/or top factors.
+   - Add UI panel (new tab) to render top positive/negative drivers and link to policy rule applied.
+3) Difficulty
+   - Low–Medium. Mostly plumbing + UI.
+
+### 3.7 CAM template compliance and structured output schema
+1) Why required
+   - CAM must be “structured” and consistent. LLM-only Markdown can drift.
+2) Where to implement
+   - Enforce a JSON schema for CAM sections (Five Cs + decision + covenants) and render to Markdown/PDF.
+   - Today: `generate_cam_with_gemini` outputs freeform Markdown; fallback is deterministic but not schema validated.
+3) Difficulty
+   - Medium. Use “LLM → JSON” pattern + validation.
+
+### 3.8 Security posture (for a fintech prototype judged by engineers)
+1) Why required
+   - Fintech judges will penalize hardcoded secrets and “permitAll” endpoints, even for MVP.
+2) Where to implement
+   - Java: `SecurityConfig.java` currently permits `/api/v1/**`, `/actuator/**`, `/h2-console/**`.
+   - Node/Python: JWT validators are permissive by design (they `next()` / return True even on failures).
+   - Remove committed secrets from `.env` files and configuration.
+3) Difficulty
+   - Low–Medium for hackathon: at least enforce internal endpoints + remove hardcoded secrets + disable H2 console.
+
+============================================================
+SECTION 4 — Weak Points That Could Lose the Hackathon (judge mode)
+============================================================
+
+### 4.1 Pillar 2 is effectively unimplemented (research agent is mock)
+- `ml-worker-python/research_agent.py` uses hardcoded strings / random values, not web crawling.
+- Any judge who asks “show me sources” will see there are none. This is the highest scoring gap.
+
+### 4.2 Pillar 1 is not end-to-end; documents are not driving decisions
+- You have a separate PDF upload endpoint on Python (`/api/v1/applications/{id}/upload-document` in `ml-worker-python/main.py`), but:
+  - Java orchestration never calls it.
+  - Frontend has no UI to upload documents.
+  - The scoring payload is populated by the mock catalog (`DatabricksIngestionService.java`), not extracted data.
+- Judges will interpret this as “a dashboard over mock data + an LLM memo generator”.
+
+### 4.3 “Explainability” exists but is not visible to the user
+- SHAP explanation computed in `ml-worker-python/explainability.py` is returned by Python but discarded by Java (`OrchestrationService.java` only picks `ml_risk_score`, anomaly flags, CAM, sentiment, news).
+- UI shows score and flags, but not “top drivers”.
+
+### 4.4 Model credibility risk (synthetic training + unrealistic claims)
+- RandomForest is trained on generated synthetic data in `RandomForestCreditScorer._generate_training_dataset` (`ml-worker-python/main.py`).
+- Comments claim “Weakly supervised on CMIE Prowess proxy data” but no real dataset ingestion exists.
+- Judges may call this “toy ML” unless you reposition it as “transparent baseline risk score + deterministic policy + research evidence”.
+
+### 4.5 Security red flags (even for hackathon)
+Concrete issues visible in code/config:
+- Hardcoded/shared JWT secrets across services:
+  - Java: `jwt.secret` in `core-backend-java/src/main/resources/application.yml`
+  - Node: default `JWT_SECRET` in `bff-node/server.js`
+  - Python: default `JWT_SECRET` in `ml-worker-python/main.py`
+- Java security: `SecurityConfig.java` permits `/api/v1/**` + actuator + H2 console.
+- “Zero-trust JWT validation” claims are contradicted by permissive behavior:
+  - Node `validateInternalJWT` calls `next()` on missing/invalid tokens (`bff-node/server.js`)
+  - Python `validate_jwt` returns True on failure (`ml-worker-python/main.py`)
+- Hardcoded AES “master key seed”: `AesEncryptionUtil.MASTER_KEY_BASE64`
+
+Why this matters for judging:
+- Fintech hackathons (especially corporate) often have judges who are security-minded; these will be flagged.
+- Minimal fixes (even if not perfect) signal maturity.
+
+### 4.6 Deployment fragility risk
+- Port/config mismatch risk noted: Java Dockerfile exposes 8080 while app uses 8090 (per repo scan). This commonly breaks container demos.
+- Python defines `/health` twice (`ml-worker-python/main.py`), increasing uncertainty about what the health endpoint returns in a live demo.
+
+============================================================
+SECTION 5 — High Impact Features to Add Quickly (24–48h)
+============================================================
+
+These are specifically chosen to maximize judging score quickly, using your existing architecture.
+
+### 5.1 “Evidence-backed Research” with citations (Pillar 2)
+Deliverable:
+- For a selected company, show:
+  - 5–10 recent news items with source URLs and timestamps
+  - 1–2 regulatory/sector notes
+  - litigation indicators (even if partial)
+  - a summarized “Character/Conditions” section in CAM with citations
+Why high impact:
+- Converts the weakest pillar into a visible demo advantage.
+
+### 5.2 Document Upload UI + PDF extraction preview + human validation toggle (Pillar 1)
+Deliverable:
+- Add a UI flow: upload PDF(s) → show extracted tables/fields + confidence → “approve extraction” → then run analysis.
+Why high impact:
+- Judges can watch your system “ingest messy data” live.
+- Even partial extraction + human confirmation reads as “realistic underwriting workflow”.
+
+### 5.3 Explainability panel in UI (Top drivers + policy rule trace)
+Deliverable:
+- UI tab: “Explainability”
+  - Top 3 positive/negative features (from SHAP or feature importance)
+  - The deterministic policy rule applied (`PricingMatrixService`) with rationale
+Why high impact:
+- Instantly checks the “Explainable AI reasoning” box.
+
+### 5.4 Replace random GST mismatch with real reconciliation from parsed docs
+Deliverable:
+- If GST return + bank statement uploaded:
+  - compute monthly GST taxable value vs bank credits and show variance %
+  - flag if variance above threshold
+Why high impact:
+- Directly addresses “circular trading / revenue inflation” requirement with Indian context.
+
+============================================================
+SECTION 6 — Exact Implementation Suggestions (libraries, APIs, approach)
+============================================================
+
+This section is intentionally concrete and aligned to your current code structure.
+
+### 6.1 PDF parsing (text + tables + layout)
+Current state:
+- Text extraction: PyMuPDF `fitz` and pdfplumber (`ml-worker-python/document_ai.py`)
+- Table extraction: pdfplumber `page.extract_tables()`
+
+Recommended upgrades (practical 48h):
+- Use `pdfplumber` + `camelot` (lattice/stream) for better tables in financial statements.
+  - Add: `camelot-py[cv]` (requires ghostscript), or use `tabula-py` (requires Java).
+- Add a “page quality detector”:
+  - If extracted text per page < threshold → mark as “scanned” → OCR route.
+- Normalize Indian units robustly:
+  - Enhance `_extract_amount` in `document_ai.py` to handle “₹ in lakhs/crores” columns and parentheses negatives.
+
+### 6.2 OCR for scanned documents
+Recommended options (ranked for hackathon practicality):
+- **PaddleOCR** (best accuracy for mixed layouts; heavier but strong)
+- **Tesseract** (fast to integrate; weaker on tables)
+Implementation approach:
+- In `document_ai.extract_text_from_pdf`:
+  - if `char_count` is low for a page, render page to image via PyMuPDF (`page.get_pixmap`) then OCR.
+- Store OCR confidence and set `humanValidationRequired` in Java `LoanApplication` when confidence < threshold.
+
+### 6.3 Bank statement parsing
+Practical approach:
+- Prefer supporting **CSV/Excel** statements first (many banks allow exports).
+- For PDF statements:
+  - Extract tables → map columns (“Date”, “Narration”, “Debit”, “Credit”, “Balance”) with fuzzy matching.
+Libraries:
+- `pandas` + `dateparser` (Indian date formats), `rapidfuzz` for header matching.
+Outputs:
+- monthly cashflow summary, bounce detection, average balance, top counterparties, round-trip detection heuristic.
+
+### 6.4 GST filings parsing & reconciliation
+Parsing:
+- Keep `parse_gst_return` but add:
+  - tax period parsing (`tax period`, `return period`)
+  - monthly time series extraction where possible
+Reconciliation:
+- Replace `research_agent.analyze_gst_reconciliation` randomness with:
+  - variance = |GST taxable value - bank credits| / max(bank credits, eps)
+  - time-lag tolerant window (e.g., 30–45 days)
+- Produce a structured risk flag list fed into CAM “Capacity/Character”.
+
+### 6.5 Web research agent (minimum viable but credible)
+Goal: show real sources + citations.
+
+Option A (fastest, most credible in demo):
+- Use a search API (SerpAPI / Google Programmable Search / Brave Search) to get top results.
+- Fetch pages with `httpx`, extract main content with `trafilatura` or `readability-lxml`.
+- Summarize with Gemini but **include citations** (URLs + snippet quotes).
+
+Where:
+- Implement in `ml-worker-python/research_agent.py` (replace mock functions).
+- Return structured object: `news: [{title, url, source, published_at, snippet}]`, `litigation`, `mca`, `sector_notes`.
+
+Indian sources (realistic hackathon versions):
+- MCA: if official APIs are hard, use public HTML pages cautiously + cache + rate limit; alternatively, show how CIN is resolved and mock the final filing fields but cite the MCA page.
+- eCourts/NCLT: implement a limited “keyword search + citation” using public case listing pages if accessible; otherwise show “litigation search attempted” plus 2–3 credible sources (Bar & Bench, LiveLaw, etc.) with citations.
+
+### 6.6 Explainability layer (surface to UI)
+Current:
+- SHAP explanation computed: `ml-worker-python/explainability.py`
+Missing:
+- Persistence + UI.
+
+Implementation approach:
+- In Java `OrchestrationService.java`, persist:
+  - `top_positive_factors`, `top_negative_factors`, and `narrative` from `shap_explanation`
+- Add a new field to `LoanApplication` or add a new entity table `ModelExplanation`.
+- Frontend: add an “Explainability” panel rendering the narrative + top factors.
+
+### 6.7 CAM generation: enforce a schema
+Current:
+- Freeform Markdown from Gemini.
+
+Implementation approach:
+- Ask Gemini for a JSON object with keys:
+  - `executive_summary`, `five_cs: {character, capacity, capital, collateral, conditions}`, `risk_matrix`, `recommendation`, `covenants`, `sources`
+- Validate with Pydantic on Python side; then render to Markdown/PDF using your existing exporter.
+Why it helps:
+- Stable demo output; easier to show “structured CAM” requirement.
+
+============================================================
+SECTION 7 — Minimal Hackathon Winning Architecture (simplified but powerful)
+============================================================
+
+If you had to re-scope to what can convincingly win:
+
+### 7.1 Core idea
+Build a “Credit Evidence Engine”:
+- Deterministic policy decisioning (already in `PricingMatrixService.java`)
+- Transparent baseline ML risk score + explainability (already in Python, just surface it)
+- Real document extraction + human validation loop (wire existing `document_ai.py` into pipeline)
+- Real web research with citations (replace mock `research_agent.py`)
+
+### 7.2 Proposed minimal architecture
+
+Frontend (Next.js):
+- Workflow: Upload docs → Review extraction → Run analysis → View CAM + Explainability + Evidence links.
+
+BFF (Node):
+- Keep as-is for real-time progress; add endpoints to proxy document upload to Python and to fetch “evidence pack”.
+
+Java backend:
+- Keep as orchestrator + system-of-record.
+- Persist extracted fields and explanation summaries.
+- Keep deterministic pricing matrix as final decision (regulator-friendly).
+
+Python worker:
+- Modules:
+  - Document Ingestor: PDF/OCR + parsing + validation (Pillar 1)
+  - Research Agent: search + fetch + cite (Pillar 2)
+  - Scoring: baseline ML + anomaly heuristics (Pillar 3)
+  - CAM Synthesizer: schema-based; includes citations (Pillar 3)
+
+Data store:
+- For hackathon: keep H2 but persist to file-based DB or Postgres if time.
+- Minimum: store “evidence pack” JSON per application (document extractions + web results + derived flags).
+
+============================================================
+SECTION 8 — 48 Hour Implementation Roadmap
+============================================================
+
+Day 1 (0–24h): Make Pillar 1 + Explainability visible end-to-end
+- Wire PDF ingestion into workflow
+  - Add BFF proxy route: `POST /api/applications/:id/upload-document` → Python `/api/v1/applications/{id}/upload-document`
+  - Add Java endpoint to attach parsed outputs to `LoanApplication` (or store raw JSON); then include in ML payload.
+  - Add UI: upload PDF(s) and show extraction preview with confidence.
+- Fix immediate demo risks
+  - Remove duplicate `/health` route in `ml-worker-python/main.py` (keep one).
+  - Fix Java Docker port mismatch if you plan docker demo.
+- Surface explainability
+  - Persist SHAP narrative/top factors in Java.
+  - Add UI panel for “Top drivers” + “Policy rule applied”.
+
+Day 2 (24–48h): Replace mock research with real evidence-backed research
+- Implement real news search + citations in `ml-worker-python/research_agent.py`
+  - Return list of sources and a summarized intelligence section.
+- Add “Evidence pack” view in UI
+  - List sources with clickable links.
+  - Show extracted risk flags: litigation, adverse news, watchlists.
+- Integrate research into CAM
+  - Add citations to Character/Conditions.
+
+Final demo preparation (last 3–6h)
+- Prepare 2–3 curated company demos:
+  - a “clean” borrower (approve)
+  - a “stressed” borrower (conditional)
+  - a “fraud/circular trading” borrower (reject)
+- For each: have one PDF statement + one GST return + one bank statement (even if simplified).
+- Record backup screenshots/video in case live web sources fail.
+
+============================================================
+SECTION 9 — Demo Strategy (what to show judges)
+============================================================
+
+### 9.1 The story (judge-friendly narrative)
+“We built an AI-powered Corporate Credit Decisioning Engine that produces an RBI-aligned CAM with a deterministic decision policy, backed by evidence from uploaded documents and external intelligence sources. The AI is explainable: every score is traceable to features, anomalies, and cited sources.”
+
+### 9.2 Demo script (5–7 minutes)
+1) Show ingestion of documents (Pillar 1)
+   - Upload a messy PDF (financial statement / GST return).
+   - Show extracted key fields + confidence; approve/flag for human validation.
+2) Trigger pipeline (real-time progress)
+   - Click “Generate Credit Intelligence & CAM” and show the stepper updates from BFF (already works).
+3) Show explainability (Pillar 3)
+   - Show top factors driving score + anomaly signals (circular trading signals CT-1..CT-4).
+   - Show deterministic policy outcome (limit + rate) from `PricingMatrixService.java`.
+4) Show research evidence with citations (Pillar 2)
+   - Display 5–10 news items with source links.
+   - Highlight one litigation/regulatory item.
+5) CAM output (structured + Five Cs)
+   - Scroll the CAM with Five Cs headings.
+   - Point to citations embedded in Character/Conditions.
+
+### 9.3 How to show “explainability” convincingly
+- Present a “Decision Trace” panel:
+  - Inputs: extracted financials + GST + bank summary + officer notes
+  - Model score + top drivers (SHAP)
+  - Anomaly flags + rationale
+  - Policy engine rule applied + final recommended terms
+  - Evidence links (news + filings)
+
+============================================================
+Appendix A — Concrete “what exists today” summary (for judges)
+============================================================
+
+What is strong today (demo-ready):
+- Multi-service orchestration with real-time progress UX:
+  - Java orchestrator + BFF Socket.io + Next.js stepper (`OrchestrationService.java`, `bff-node/server.js`, `useSocket.ts`)
+- Deterministic policy engine that outputs amount + rate:
+  - `PricingMatrixService.java`
+- CAM generation in Five Cs format with Gemini fallback:
+  - `ml-worker-python/main.py`
+- SHAP explainability module exists:
+  - `ml-worker-python/explainability.py`
+
+What is currently “mock / not hackathon compliant”:
+- Research agent: mock + randomized outputs (`ml-worker-python/research_agent.py`)
+- Databricks ingestion: mock dataset (`DatabricksIngestionService.java`)
+- PDF extraction exists but is not integrated with underwriting decision flow (`document_ai.py` + upload endpoint not used by Java/UI)
+

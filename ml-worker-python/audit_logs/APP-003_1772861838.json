@@ -1,0 +1,43 @@
+{
+  "audit_id": "a7772603f6819d9f3fb2742a9dea347068074b390b5203a083d83580d613b170",
+  "application_id": "APP-003",
+  "event": "ML_ANALYSIS_COMPLETE",
+  "timestamp": "2026-03-07T05:37:18.309162+00:00",
+  "payload": {
+    "ml_score": 0.0,
+    "adjusted_score": 0.0,
+    "anomaly": {
+      "anomaly_detected": true,
+      "circular_trading_risk": true,
+      "anomaly_score": 0.6947,
+      "severity": "CRITICAL",
+      "anomaly_details": "SIGNAL-CT-1: Revenue YoY growth 87.3% is anomalously high but GST compliance only 31.0% \u2014 possible circular invoice trading\nSIGNAL-CT-2: Extreme D/E ratio 15.42x with EBITDA margin only 2.1% \u2014 balance sheet leveraged beyond operating capacity\nSIGNAL-CT-3: Interest Coverage 0.91x < 1.0 (cannot service debt) yet revenue claims 87.3% growth \u2014 unreliable revenue quality\nSIGNAL-CT-4: Critical GST compliance failure (31.0%) \u2014 strong indicator of grey market transactions or shell entity behaviour",
+      "circular_trading_signals": [
+        "SIGNAL-CT-1: Revenue YoY growth 87.3% is anomalously high but GST compliance only 31.0% \u2014 possible circular invoice trading",
+        "SIGNAL-CT-2: Extreme D/E ratio 15.42x with EBITDA margin only 2.1% \u2014 balance sheet leveraged beyond operating capacity",
+        "SIGNAL-CT-3: Interest Coverage 0.91x < 1.0 (cannot service debt) yet revenue claims 87.3% growth \u2014 unreliable revenue quality",
+        "SIGNAL-CT-4: Critical GST compliance failure (31.0%) \u2014 strong indicator of grey market transactions or shell entity behaviour"
+      ],
+      "engineered_features": {
+        "gst_revenue_divergence": 0.563,
+        "leverage_stress_index": 16.9451
+      }
+    },
+    "sentiment": {
+      "sentiment_score": -1.0,
+      "sentiment_label": "NEGATIVE",
+      "positive_signals_found": 0,
+      "negative_signals_found": 1,
+      "critical_flags": [
+        "fraud"
+      ],
+      "analysis_summary": "Site visit notes yield NEGATIVE sentiment (score: -1.000). Found 0 positive and 1 negative credit signals. CRITICAL FLAGS: fraud."
+    },
+    "drift": {
+      "drift_detected": false,
+      "psi": 0.0,
+      "alert": null
+    },
+    "processing_ms": 666.022705078125
+  }
+}

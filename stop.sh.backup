@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# Safe stop script for IntelliCredit services
+# Only kills processes related to this specific project
+
+set -e  # Exit on any error
+
+echo "🛑 Stopping IntelliCredit Services..."
+
+# Project-specific process patterns (more specific to avoid killing system processes)
+PROJECT_PATTERNS=(
+    "uvicorn main:app"                    # ML Worker
+    "java -jar.*intellicredit"           # Java backend
+    "nodemon.*server.js"                 # BFF dev server
+    "next-server"                        # Next.js frontend
+    "npm run dev.*bff-node"              # BFF npm dev
+    "npm run dev.*frontend-nextjs"       # Frontend npm dev
+)
+
+# Function to safely kill processes by exact pattern
+safe_kill() {
+    local pattern="$1"
+    local signal="${2:-TERM}"
+
+    # Find PIDs that match the exact pattern and are in our project directory
+    local pids=$(ps aux | grep -v grep | grep "$pattern" | grep "$(pwd)" | awk '{print $2}' || true)
+
+    if [ ! -z "$pids" ]; then
+        echo " - Killing processes matching '$pattern' (PIDs: $pids)"
+        echo "$pids" | xargs kill -$signal 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+# Function to wait for processes to die
+wait_for_death() {
+    local pattern="$1"
+    local max_wait=10
+    local count=0
+
+    while [ $count -lt $max_wait ]; do
+        if ! ps aux | grep -v grep | grep "$pattern" | grep -q "$(pwd)"; then
+            return 0
+        fi
+        sleep 1
+        ((count++))
+    done
+    return 1
+}
+
+# 1. Try graceful shutdown first
+echo "Attempting graceful shutdown..."
+for pattern in "${PROJECT_PATTERNS[@]}"; do
+    safe_kill "$pattern" "TERM"
+done
+
+# 2. Wait for graceful shutdown
+echo "Waiting for graceful shutdown..."
+for pattern in "${PROJECT_PATTERNS[@]}"; do
+    if wait_for_death "$pattern"; then
+        echo " - Process '$pattern' stopped gracefully"
+    else
+        echo " - Process '$pattern' did not stop gracefully, forcing..."
+        safe_kill "$pattern" "KILL"
+    fi
+done
+
+# 3. Kill by IntelliCredit-specific port (safer approach)
+TARGET_PORTS=(8001 8090 3001 3000)
+for port in "${TARGET_PORTS[@]}"; do
+    # Only kill if the process is actually running on this port AND in our project
+    local pid=$(lsof -ti :$port 2>/dev/null | head -1 || true)
+    if [ ! -z "$pid" ]; then
+        # Verify it's our process by checking the command line
+        if ps -p $pid -o cmd= | grep -q "$(pwd)" 2>/dev/null; then
+            echo " - Killing process on port $port (PID: $pid)"
+            kill -TERM $pid 2>/dev/null || true
+            sleep 2
+            if ps -p $pid > /dev/null 2>&1; then
+                kill -KILL $pid 2>/dev/null || true
+            fi
+        fi
+    fi
+done
+
+# 4. Final verification
+echo "Verifying all services stopped..."
+ACTIVE_PROCESSES=0
+for port in "${TARGET_PORTS[@]}"; do
+    if lsof -i :$port > /dev/null 2>&1; then
+        ((ACTIVE_PROCESSES++))
+    fi
+done
+
+# Also check for any remaining IntelliCredit processes
+REMAINING=$(ps aux | grep -v grep | grep -c "$(pwd)" || true)
+if [ "$REMAINING" -gt 1 ]; then  # >1 because grep itself might show up
+    ((ACTIVE_PROCESSES++))
+fi
+
+if [ $ACTIVE_PROCESSES -eq 0 ]; then
+    echo "✅ All IntelliCredit services stopped successfully"
+else
+    echo "⚠️  Some processes may still be running. You may need to manually kill them."
+fi
+
+echo "Stop script completed."
+
+

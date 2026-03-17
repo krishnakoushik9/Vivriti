@@ -1,0 +1,80 @@
+{
+  "audit_id": "6137df3b48d5ee14caf4cc8abe512ea113095a2918105c61a063eba99253e680",
+  "application_id": "APP-001",
+  "event": "DEEP_CRAWL_COMPLETE",
+  "timestamp": "2026-03-17T15:38:47.003696+00:00",
+  "payload": {
+    "company_name": "TechGrow Solutions Pvt Ltd",
+    "research": {
+      "mca_status": {
+        "status": "UNKNOWN_PUBLIC_DATA",
+        "directors_active": null,
+        "strike_off_warning": null,
+        "details": "Public web search performed; official MCA21 compliance requires authenticated lookup (CIN + filings).",
+        "citations": []
+      },
+      "cibil_commercial": {
+        "cmr_rank": "CMR-5",
+        "credit_score": 650,
+        "active_facilities": null,
+        "dpd_30_plus": 0,
+        "dpd_90_plus": 0,
+        "recent_enquiries": null,
+        "details": "Commercial Credit Rank 5. Clean repayment history."
+      },
+      "ecourts_litigation": {
+        "litigation_found": false,
+        "active_cases": null,
+        "nclt_petitions": null,
+        "details": "Public search performed; findings require legal validation. No case numbers or penalty amounts are asserted without source text.",
+        "citations": [],
+        "raw_evidence": []
+      },
+      "gst_reconciliation": {
+        "status": "CRITICAL_MISMATCH",
+        "gstr_3b_vs_bank": "45.0% variance (heuristic)",
+        "circular_trading_risk": "HIGH",
+        "details": "GST compliance is critically low; revenue authenticity risk elevated. Reconcile GSTR-3B vs bank credits and validate counterparties."
+      },
+      "web_news": "Recent public sources:\n- Wikipedia: Lenskart \u2014 Lenskart Solutions Limited is an Indian multinational eyewear company, based in Gurgaon. As a vertically integrated company, it designs, manufactures\n- Wikipedia: Hybe \u2014 Entertainment) into a tech-driven lifestyle platform corporation. The company operates under three main pillars: Labels, Solutions, and Platforms, with\n- Wikipedia: Defence industry of Pakistan \u2014 &quot;LEOS \u2013 &quot;Laser &amp; Electro Optical Solutions, (Pvt) Ltd&quot;. Retrieved 2024-04-07. &quot;DynTek Engg&quot;. DYNTEK ENGINEERING PVT LTD. Dawn.com (2021-03-15). &quot;Pakistan\n- Wikipedia: Space industry of India \u2014 India&#039;s military and strategic space applications. For instance, Sisir Radar Pvt. Ltd., founded by former ISRO Director Tapan Misra, is developing an L- and\n- Wikipedia: Ola Consumer \u2014 Google Maps API, with Aggarwal urging Indian developers to use India-based solutions. In July 2015, Ola launched Ola Store, a grocery delivery service in Bangalore",
+      "news_items": [
+        {
+          "title": "Wikipedia: Lenskart",
+          "url": "https://en.wikipedia.org/wiki/Lenskart",
+          "snippet": "Lenskart Solutions Limited is an Indian multinational eyewear company, based in Gurgaon. As a vertically integrated company, it designs, manufactures",
+          "source": "wikipedia",
+          "published_at": null
+        },
+        {
+          "title": "Wikipedia: Hybe",
+          "url": "https://en.wikipedia.org/wiki/Hybe",
+          "snippet": "Entertainment) into a tech-driven lifestyle platform corporation. The company operates under three main pillars: Labels, Solutions, and Platforms, with",
+          "source": "wikipedia",
+          "published_at": null
+        },
+        {
+          "title": "Wikipedia: Defence industry of Pakistan",
+          "url": "https://en.wikipedia.org/wiki/Defence_industry_of_Pakistan",
+          "snippet": "&quot;LEOS \u2013 &quot;Laser &amp; Electro Optical Solutions, (Pvt) Ltd&quot;. Retrieved 2024-04-07. &quot;DynTek Engg&quot;. DYNTEK ENGINEERING PVT LTD. Dawn.com (2021-03-15). &quot;Pakistan",
+          "source": "wikipedia",
+          "published_at": null
+        },
+        {
+          "title": "Wikipedia: Space industry of India",
+          "url": "https://en.wikipedia.org/wiki/Space_industry_of_India",
+          "snippet": "India&#039;s military and strategic space applications. For instance, Sisir Radar Pvt. Ltd., founded by former ISRO Director Tapan Misra, is developing an L- and",
+          "source": "wikipedia",
+          "published_at": null
+        },
+        {
+          "title": "Wikipedia: Ola Consumer",
+          "url": "https://en.wikipedia.org/wiki/Ola_Consumer",
+          "snippet": "Google Maps API, with Aggarwal urging Indian developers to use India-based solutions. In July 2015, Ola launched Ola Store, a grocery delivery service in Bangalore",
+          "source": "wikipedia",
+          "published_at": null
+        }
+      ]
+    },
+    "processing_time_ms": 158801.02
+  }
+}

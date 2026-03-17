@@ -1,0 +1,38 @@
+{
+  "audit_id": "358ea969d27ea63f03a3f895398b73e4ae0202fd5e56366707977fa30c420b4d",
+  "application_id": "APP-001",
+  "event": "ML_ANALYSIS_COMPLETE",
+  "timestamp": "2026-03-06T17:02:39.874104+00:00",
+  "payload": {
+    "ml_score": 100.0,
+    "adjusted_score": 100.0,
+    "anomaly": {
+      "anomaly_detected": "True",
+      "circular_trading_risk": false,
+      "anomaly_score": 0.5509,
+      "severity": "HIGH",
+      "anomaly_details": "No anomaly signals detected",
+      "circular_trading_signals": [],
+      "engineered_features": {
+        "gst_revenue_divergence": -0.685,
+        "leverage_stress_index": 0.1375
+      }
+    },
+    "sentiment": {
+      "sentiment_score": 1.0,
+      "sentiment_label": "POSITIVE",
+      "positive_signals_found": 2,
+      "negative_signals_found": 0,
+      "critical_flags": [],
+      "analysis_summary": "Site visit notes yield POSITIVE sentiment (score: 1.000). Found 2 positive and 0 negative credit signals. "
+    },
+    "drift": {
+      "drift_detected": true,
+      "psi": 3.9243,
+      "threshold": 0.05,
+      "alert": "DRIFT ALERT: PSI=3.9243 exceeds threshold 0.05. Model retraining recommended.",
+      "recommendation": "Trigger model retraining pipeline"
+    },
+    "processing_ms": 214.373291015625
+  }
+}

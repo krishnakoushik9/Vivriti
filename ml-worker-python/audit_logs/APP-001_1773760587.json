@@ -1,0 +1,10 @@
+{
+  "audit_id": "3cf5f9d8ca67beb11494134faffe7bd14203a540c025c3c66fda5771860e6c9d",
+  "application_id": "APP-001",
+  "event": "CAM_EXPORTED",
+  "timestamp": "2026-03-17T15:16:27.636231+00:00",
+  "payload": {
+    "format": "docx",
+    "file_path": "./exports/CAM_APP-001.docx"
+  }
+}

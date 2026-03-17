@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  core-backend-java:
+    build:
+      context: ./core-backend-java
+      dockerfile: Dockerfile
+    ports:
+      - "8090:8090"
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+    depends_on:
+      - ml-worker-python
+      - bff-node
+
+  ml-worker-python:
+    build:
+      context: ./ml-worker-python
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - JAVA_BACKEND_URL=http://core-backend-java:8090
+
+  bff-node:
+    build:
+      context: ./bff-node
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - JAVA_BACKEND_URL=http://core-backend-java:8090
+      - FRONTEND_URL=http://localhost:3000
+
+# Note: Next.js frontend is typically run locally during dev using `npm run dev`

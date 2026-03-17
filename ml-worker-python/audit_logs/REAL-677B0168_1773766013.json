@@ -1,0 +1,11 @@
+{
+  "audit_id": "ff8e249e8a9950a111fff3d7c6b5c4fa417a38204972309667a6850881b98d8b",
+  "application_id": "REAL-677B0168",
+  "event": "DOCUMENT_INGESTED",
+  "timestamp": "2026-03-17T16:46:53.285329+00:00",
+  "payload": {
+    "file_name": "tata-motor-IAR-2024-25.pdf",
+    "doc_type": "income_statement",
+    "confidence": 1.0
+  }
+}

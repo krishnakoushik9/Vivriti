@@ -1,0 +1,36 @@
+{
+  "audit_id": "5e0aca35b6274aecece71ac78c3fffae1061114210c7050bd6dba2837df68ba8",
+  "application_id": "TEST-3",
+  "event": "ML_ANALYSIS_COMPLETE",
+  "timestamp": "2026-03-17T14:50:28.079936+00:00",
+  "payload": {
+    "ml_score": 94.55,
+    "adjusted_score": 94.55,
+    "anomaly": {
+      "anomaly_detected": false,
+      "circular_trading_risk": false,
+      "anomaly_score": 0.4762,
+      "severity": "MILD",
+      "anomaly_details": "No anomaly signals detected",
+      "circular_trading_signals": [],
+      "engineered_features": {
+        "gst_revenue_divergence": -0.77,
+        "leverage_stress_index": 0.48
+      }
+    },
+    "sentiment": {
+      "sentiment_score": 0.0,
+      "sentiment_label": "NEUTRAL",
+      "positive_signals_found": 0,
+      "negative_signals_found": 0,
+      "critical_flags": [],
+      "analysis_summary": "Site visit notes yield NEUTRAL sentiment (score: 0.000). Found 0 positive and 0 negative credit signals. "
+    },
+    "drift": {
+      "drift_detected": false,
+      "psi": 0.0,
+      "alert": null
+    },
+    "processing_ms": 5712.542724609375
+  }
+}
