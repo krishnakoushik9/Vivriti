@@ -67,3 +67,8 @@ pnpm-debug.log*
 .Trashes
 ehthumbs.db
 Thumbs.db
+audit_logs/
+**/audit_logs/
+ml-worker-python/venv/
+ML-Model/
+ml-worker-python/exports/

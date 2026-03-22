@@ -31,6 +31,108 @@ const FormData = require("form-data");
 const Redis = require("ioredis");
 const cron = require("node-cron");
 
+// ─────────────────────────────────────────────
+// Circuit Breaker State
+// ─────────────────────────────────────────────
+const circuitBreaker = {
+  python: { state: "CLOSED", failures: 0, lastFailure: null, threshold: 3, cooldown: 30000 },
+  java: { state: "CLOSED", failures: 0, lastFailure: null, threshold: 5, cooldown: 15000 },
+};
+
+function isCircuitOpen(service) {
+  const cb = circuitBreaker[service];
+  if (cb.state === "OPEN") {
+    const elapsed = Date.now() - cb.lastFailure;
+    if (elapsed > cb.cooldown) {
+      cb.state = "HALF_OPEN";
+      logger.info(`[CB] ${service} circuit HALF_OPEN — probing`);
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function recordSuccess(service) {
+  const cb = circuitBreaker[service];
+  cb.failures = 0;
+  cb.state = "CLOSED";
+}
+
+function recordFailure(service) {
+  const cb = circuitBreaker[service];
+  cb.failures++;
+  cb.lastFailure = Date.now();
+  if (cb.failures >= cb.threshold) {
+    cb.state = "OPEN";
+    logger.error(`[CB] ${service} circuit OPEN after ${cb.failures} failures`);
+  }
+}
+
+// ─────────────────────────────────────────────
+// OCR-LLM In-Process Queue
+// ─────────────────────────────────────────────
+const { EventEmitter } = require("events");
+const ocrQueue = [];
+let ocrWorkerRunning = false;
+
+async function runOcrLlm({ fileBuffer, filename, applicationId }) {
+  const form = new FormData();
+  form.append("file", fileBuffer, {
+    filename: filename,
+    contentType: "application/pdf",
+  });
+
+  const token = generateInternalServiceToken("bff-node");
+
+  logger.info(`[BFF] Starting runOcrLlm for application ${applicationId}`);
+  
+  // Circuit Breaker check
+  if (isCircuitOpen("python")) {
+    throw new Error("ML service temporarily unavailable (Circuit OPEN)");
+  }
+
+  try {
+    const response = await axios.post(`${PYTHON_WORKER_URL}/analyze-ocr-llm`, form, {
+      headers: {
+        ...form.getHeaders(),
+        Authorization: `Bearer ${token}`,
+      },
+      timeout: 600000, // 600s
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    });
+    recordSuccess("python");
+    return response.data;
+  } catch (err) {
+    recordFailure("python");
+    throw err;
+  }
+}
+
+async function enqueueOcrJob(job) {
+  return new Promise((resolve, reject) => {
+    ocrQueue.push({ ...job, resolve, reject });
+    processOcrQueue();
+  });
+}
+
+async function processOcrQueue() {
+  if (ocrWorkerRunning || ocrQueue.length === 0) return;
+  ocrWorkerRunning = true;
+  const job = ocrQueue.shift();
+  try {
+    const result = await runOcrLlm(job);
+    job.resolve(result);
+  } catch (err) {
+    job.reject(err);
+  } finally {
+    ocrWorkerRunning = false;
+    processOcrQueue();
+  }
+}
+
+
 // Scraper modules (added for web intelligence)
 const {
   probeConnectivity,
@@ -399,10 +501,20 @@ app.post("/internal/progress", validateInternalJWT, (req, res) => {
     // Small delay to let frontend process the progress first
     setTimeout(async () => {
       try {
-        const appResponse = await axios.get(
-          `${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}`,
-          { timeout: 5000 }
-        );
+        if (isCircuitOpen("java")) {
+          throw new Error("Java service circuit OPEN");
+        }
+        let appResponse;
+        try {
+          appResponse = await axios.get(
+            `${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}`,
+            { timeout: 5000 }
+          );
+          recordSuccess("java");
+        } catch (err) {
+          recordFailure("java");
+          throw err;
+        }
         io.to(`app:${applicationId}`).emit("analysis:complete", {
           applicationId,
           application: appResponse.data,
@@ -435,6 +547,10 @@ app.post("/internal/progress", validateInternalJWT, (req, res) => {
  */
 async function proxyToJava(req, res, path, method = "GET", body = null) {
   const timer = proxyRequestDuration.startTimer();
+  if (isCircuitOpen("java")) {
+    timer();
+    return res.status(503).json({ error: "Java backend temporarily unavailable. Try again in 15 seconds.", circuit: "OPEN" });
+  }
   try {
     const url = `${JAVA_BACKEND_URL}${path}`;
     const config = {
@@ -446,9 +562,11 @@ async function proxyToJava(req, res, path, method = "GET", body = null) {
     };
 
     const response = await axios(config);
+    recordSuccess("java");
     timer();
     res.status(response.status).json(response.data);
   } catch (err) {
+    recordFailure("java");
     timer();
     logger.error(`[PROXY] ${method} ${path} failed: ${err.message}`);
     const status = err.response?.status || 502;
@@ -498,7 +616,17 @@ app.get("/api/applications/:applicationId/export-cam", async (req, res) => {
   }
   try {
     // Fetch current CAM markdown from Java
-    const appResp = await axios.get(`${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}`, { timeout: 10000 });
+    if (isCircuitOpen("java")) {
+      return res.status(503).json({ error: "Java backend temporarily unavailable", circuit: "OPEN" });
+    }
+    let appResp;
+    try {
+      appResp = await axios.get(`${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}`, { timeout: 10000 });
+      recordSuccess("java");
+    } catch (err) {
+      recordFailure("java");
+      throw err;
+    }
     const app = appResp.data || {};
     const camMarkdown = app.camDocument;
     const companyName = app.companyName || "Company";
@@ -507,15 +635,25 @@ app.get("/api/applications/:applicationId/export-cam", async (req, res) => {
     }
 
     const token = generateInternalServiceToken("bff-node");
-    const pythonResp = await axios.post(
-      `${PYTHON_WORKER_URL}/api/v1/applications/${applicationId}/export-cam?format=${format}`,
-      { cam_markdown: camMarkdown, company_name: companyName },
-      {
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        timeout: 120000,
-        responseType: "stream",
-      }
-    );
+    if (isCircuitOpen("python")) {
+      return res.status(503).json({ error: "ML service temporarily unavailable", circuit: "OPEN" });
+    }
+    let pythonResp;
+    try {
+      pythonResp = await axios.post(
+        `${PYTHON_WORKER_URL}/api/v1/applications/${applicationId}/export-cam?format=${format}`,
+        { cam_markdown: camMarkdown, company_name: companyName },
+        {
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          timeout: 120000,
+          responseType: "stream",
+        }
+      );
+      recordSuccess("python");
+    } catch (err) {
+      recordFailure("python");
+      throw err;
+    }
 
     const contentType = pythonResp.headers["content-type"] || (format === "pdf" ? "application/pdf" : "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     const dispo = pythonResp.headers["content-disposition"] || `attachment; filename="CAM_${applicationId}.${format}"`;
@@ -559,15 +697,35 @@ app.post("/api/applications/:applicationId/deep-crawl", async (req, res) => {
     io.to(`app:${applicationId}`).emit("progress:update", startEvt);
     if (redisPub) redisPub.publish(REDIS_CHANNEL_PROGRESS, JSON.stringify(startEvt));
 
-    const appResp = await axios.get(`${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}`, { timeout: 10000 });
+    if (isCircuitOpen("java")) {
+      throw new Error("Java service temporarily unavailable");
+    }
+    let appResp;
+    try {
+      appResp = await axios.get(`${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}`, { timeout: 10000 });
+      recordSuccess("java");
+    } catch (err) {
+      recordFailure("java");
+      throw err;
+    }
     const app = appResp.data || {};
     const companyName = app.companyName || "Company";
 
-    const py = await axios.post(
-      `${PYTHON_WORKER_URL}/api/v1/applications/${applicationId}/deep-crawl`,
-      { company_name: companyName },
-      { headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, timeout: 180000 }
-    );
+    if (isCircuitOpen("python")) {
+      throw new Error("ML service temporarily unavailable");
+    }
+    let py;
+    try {
+      py = await axios.post(
+        `${PYTHON_WORKER_URL}/api/v1/applications/${applicationId}/deep-crawl`,
+        { company_name: companyName },
+        { headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, timeout: 180000 }
+      );
+      recordSuccess("python");
+    } catch (err) {
+      recordFailure("python");
+      throw err;
+    }
 
     const doneEvt = {
       eventId: uuidv4(),
@@ -607,10 +765,57 @@ app.post("/api/applications/:applicationId/deep-crawl", async (req, res) => {
 app.post("/api/applications/:applicationId/upload-document", upload.single("file"), async (req, res) => {
   const { applicationId } = req.params;
   if (!req.file) {
-    return res.status(400).json({ error: "Missing file field 'file' (multipart/form-data)" });
+    return res.status(400).json({ error: 'Missing file field "file" (multipart/form-data)' });
   }
   if (!req.file.originalname.toLowerCase().endsWith(".pdf")) {
     return res.status(400).json({ error: "Only PDF files are supported" });
+  }
+
+  const useOcrLlm = req.body.use_ocr_llm === true || req.body.use_ocr_llm === "true";
+
+  if (useOcrLlm) {
+    const jobId = `ocr_${applicationId}_${Date.now()}`;
+    res.status(202).json({
+      jobId,
+      message: "OCR processing queued. Results will arrive via WebSocket.",
+    });
+
+    enqueueOcrJob({
+      fileBuffer: req.file.buffer,
+      filename: req.file.originalname,
+      applicationId,
+    })
+      .then(async (data) => {
+        // Persist extraction result into Java application
+        try {
+          if (isCircuitOpen("java")) {
+            throw new Error("Java service circuit OPEN");
+          }
+          const savedApp = await axios.post(
+            `${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}/documents`,
+            data,
+            { headers: { "Content-Type": "application/json" }, timeout: 30000 }
+          );
+          recordSuccess("java");
+          io.to(`app:${applicationId}`).emit("ocr_complete", {
+            jobId,
+            data,
+            application: savedApp.data,
+          });
+        } catch (err) {
+          recordFailure("java");
+          logger.error(`[OCR QUEUE] Failed to persist results for ${applicationId}: ${err.message}`);
+          io.to(`app:${applicationId}`).emit("ocr_failed", { jobId, error: "Persistence failed: " + err.message });
+        }
+      })
+      .catch((err) => {
+        logger.error(`[OCR QUEUE] Job ${jobId} failed: ${err.message}`);
+        io.to(`app:${applicationId}`).emit("ocr_failed", {
+          jobId,
+          error: err.message,
+        });
+      });
+    return;
   }
 
   try {
@@ -621,34 +826,55 @@ app.post("/api/applications/:applicationId/upload-document", upload.single("file
     });
 
     const token = generateInternalServiceToken("bff-node");
-    const pythonResp = await axios.post(
-      `${PYTHON_WORKER_URL}/api/v1/applications/${applicationId}/upload-document`,
-      form,
-      {
-        headers: {
-          ...form.getHeaders(),
-          Authorization: `Bearer ${token}`,
-        },
-        timeout: 120000,
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-      }
-    );
+
+    let pythonResp;
+    // Standard pipeline
+    if (isCircuitOpen("python")) {
+      return res.status(503).json({ error: "ML service temporarily unavailable. Try again in 30 seconds.", circuit: "OPEN" });
+    }
+    try {
+      pythonResp = await axios.post(
+        `${PYTHON_WORKER_URL}/api/v1/applications/${applicationId}/upload-document`,
+        form,
+        {
+          headers: {
+            ...form.getHeaders(),
+            Authorization: `Bearer ${token}`,
+          },
+          timeout: 600000,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+        }
+      );
+      recordSuccess("python");
+    } catch (err) {
+      recordFailure("python");
+      throw err;
+    }
 
     const parsed = pythonResp.data;
 
     // Persist extraction result into Java application
-    const savedApp = await axios.post(
-      `${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}/documents`,
-      parsed,
-      { headers: { "Content-Type": "application/json" }, timeout: 30000 }
-    );
-
-    return res.json({
-      success: true,
-      python_result: parsed,
-      application: savedApp.data,
-    });
+    if (isCircuitOpen("java")) {
+      return res.status(503).json({ error: "Java backend temporarily unavailable. Try again in 15 seconds.", circuit: "OPEN" });
+    }
+    try {
+      const savedApp = await axios.post(
+        `${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}/documents`,
+        parsed,
+        { headers: { "Content-Type": "application/json" }, timeout: 30000 }
+      );
+      recordSuccess("java");
+      return res.json({
+        success: true,
+        python_result: parsed,
+        application: savedApp.data,
+        method: "standard",
+      });
+    } catch (err) {
+      recordFailure("java");
+      throw err;
+    }
   } catch (err) {
     logger.error(`[DOC UPLOAD] Failed for ${applicationId}: ${err.message}`);
     const status = err.response?.status || 502;
@@ -663,19 +889,29 @@ app.get("/api/databricks/catalog", (req, res) =>
 
 // ML Worker status
 app.get("/api/ml/health", async (req, res) => {
+  if (isCircuitOpen("python")) {
+    return res.status(503).json({ status: "DOWN", message: "ML Worker unreachable (Circuit OPEN)" });
+  }
   try {
     const r = await axios.get(`${PYTHON_WORKER_URL}/health`, { timeout: 5000 });
+    recordSuccess("python");
     res.json(r.data);
   } catch {
+    recordFailure("python");
     res.status(503).json({ status: "DOWN", message: "ML Worker unreachable" });
   }
 });
 
 app.get("/api/ml/metrics", async (req, res) => {
+  if (isCircuitOpen("python")) {
+    return res.status(503).json({ error: "ML Worker unreachable (Circuit OPEN)" });
+  }
   try {
     const r = await axios.get(`${PYTHON_WORKER_URL}/model/metrics`, { timeout: 5000 });
+    recordSuccess("python");
     res.json(r.data);
   } catch {
+    recordFailure("python");
     res.status(503).json({ error: "ML Worker unreachable" });
   }
 });
@@ -838,15 +1074,145 @@ app.post("/api/research", async (req, res) => {
   };
 
   // Ship to Python + Java (best-effort, never block response)
-  const pythonPayload = { results, companyId: company.id, companyName: company.name };
-  const javaPayload = { results, companyId: company.id, companyName: company.name };
+  const app = body; // Map body as app for field compatibility
+  const applicationId = company.id;
+  const companyName = company.name;
+
+  const analyzePayload = {
+    application_id: applicationId,
+    company_name: companyName,
+    sector: app.sector || "General",
+    debt_to_equity: app.debtToEquityRatio ?? 0,
+    revenue_growth: app.revenueGrowthPercent ?? 0,
+    interest_coverage: app.interestCoverageRatio ?? 0,
+    current_ratio: app.currentRatio ?? 0,
+    ebitda_margin: app.ebitdaMargin ?? 0,
+    gst_compliance_score: app.gstComplianceScore ?? 50,
+    credit_score: Math.min(900, Math.max(300, app.creditScore ?? 650)),
+    annual_revenue: app.annualRevenue ?? 0,
+    total_debt: app.totalDebt ?? 0,
+    credit_officer_notes: app.creditOfficerNotes || "",
+    document_extractions: null,
+  };
+
+  const javaIngestPayload = { applicationId, results };
+
   Promise.allSettled([
-    axios.post(`${PYTHON_WORKER_URL}/api/v1/nlp/analyze`, pythonPayload, { timeout: 20000 }).catch(() => null),
-    axios.post(`${JAVA_BACKEND_URL}/api/v1/intelligence/ingest`, { applicationId: company.id, results }, { timeout: 20000 }).catch(() => null),
+    axios.post(`${JAVA_BACKEND_URL}/api/v1/intelligence/ingest`, javaIngestPayload, { timeout: 20000 }).catch(() => null),
   ]).then(() => { });
 
   return res.json(responseBody);
 });
+
+app.post(
+  "/api/applications/:applicationId/run-research",
+  async (req, res) => {
+    const { applicationId } = req.params;
+    try {
+      // 1. Fetch application from Java
+      const appResp = await axios.get(
+        `${JAVA_BACKEND_URL}/api/v1/applications/${applicationId}`
+      );
+      const app = appResp.data;
+
+      // 2. Build research payload
+      const company_name = app.companyName || req.body.company_name || "";
+      const payload = {
+        company_name,        // ← must be snake_case
+        promoters: app.promoters || req.body.promoters || [],
+        cin: app.cinNumber || req.body.cin || "",
+        revenue: app.annualRevenue || app.revenue || req.body.revenue || 0,
+        gst_score: app.gstComplianceScore || app.gstScore || req.body.gst_score || 0,
+        base_credit_score: app.creditScore || req.body.base_credit_score || 650,
+        application_id: applicationId,
+      };
+
+      // 3. Stream from Python worker
+      if (isCircuitOpen("python")) {
+        throw new Error("ML service temporarily unavailable (Circuit OPEN)");
+      }
+      let pythonResp;
+      try {
+        pythonResp = await axios.post(
+          `${PYTHON_WORKER_URL}/api/research/run`,
+          payload,
+          { responseType: "stream", timeout: 120000 }
+        );
+        recordSuccess("python");
+      } catch (err) {
+        recordFailure("python");
+        throw err;
+      }
+
+      res.setHeader("Content-Type", "application/x-ndjson");
+      res.setHeader("Transfer-Encoding", "chunked");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("X-Accel-Buffering", "no");
+
+      let buffer = "";
+      pythonResp.data.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const event = JSON.parse(line);
+            res.write(JSON.stringify(event) + "\n");
+
+            // On complete: ingest to Java
+            if (event.event === "complete" && event.data) {
+              const researchData = event.data;
+              const now = new Date().toISOString();
+
+              const ingestPayload = {
+                applicationId,
+                results: (researchData.articles || []).map(a => ({
+                  title: a.title || "",
+                  sourceUrl: a.url || "",
+                  sourceName: a.source || "",
+                  sourceType: a.source_type || "api",
+                  risk_score: a.risk_score ?? 0,
+                  risk_level: a.risk_level || "NONE",
+                  riskKeywordsFound: a.risk_flags || [],
+                  publishedAt: a.published_at || null,
+                  scrapedAt: now,
+                })),
+              };
+
+              axios.post(
+                `${JAVA_BACKEND_URL}/api/v1/intelligence/ingest`,
+                ingestPayload
+              ).then(() => {
+                console.log(
+                  `[BFF] Java ingest success for app=${applicationId} ` +
+                  `signals=${ingestPayload.results.length}`
+                );
+              }).catch(err => {
+                console.error(
+                  `[BFF] Java ingest failed: ${err.message}`,
+                  err.response?.data
+                );
+              });
+            }
+          } catch (e) {
+            console.warn("[BFF] Skipped partial line:", line);
+          }
+        }
+      });
+
+      pythonResp.data.on("end", () => res.end());
+      pythonResp.data.on("error", (err) => {
+        console.error("[BFF] Stream error:", err.message);
+        res.end();
+      });
+
+    } catch (err) {
+      console.error("[BFF] run-research failed:", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 // ─────────────────────────────────────────────
 // Observability
@@ -855,6 +1221,16 @@ app.get("/metrics", async (req, res) => {
   res.set("Content-Type", register.contentType);
   res.end(await register.metrics());
 });
+
+app.get("/api/circuit-status", (req, res) => {
+  res.json({
+    python: circuitBreaker.python.state,
+    java: circuitBreaker.java.state,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.use("/mca", require("./routes/mca"));
 
 app.get("/health", (req, res) => {
   res.json({
@@ -870,6 +1246,15 @@ app.get("/health", (req, res) => {
 // ─────────────────────────────────────────────
 // Start Server
 // ─────────────────────────────────────────────
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error("Port 3001 is already in use. Free the port and restart.");
+    process.exit(1);
+  } else {
+    throw err;
+  }
+});
+
 server.listen(PORT, () => {
   logger.info(`[BFF] IntelliCredit BFF started on port ${PORT}`);
   logger.info(`[BFF] WebSocket server ready`);

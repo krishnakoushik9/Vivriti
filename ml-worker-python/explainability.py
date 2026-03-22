@@ -13,55 +13,49 @@ logger = logging.getLogger("intellicredit.explainability")
 
 # Feature display names for human-readable output
 FEATURE_DISPLAY_NAMES = {
-    "debt_to_equity": "Debt-to-Equity Ratio",
-    "revenue_growth": "Revenue Growth (%)",
-    "interest_coverage": "Interest Coverage Ratio",
-    "current_ratio": "Current Ratio",
-    "ebitda_margin": "EBITDA Margin (%)",
-    "gst_compliance_score": "GST Compliance Score",
-    "credit_score_normalized": "CIBIL Credit Score",
-    "revenue_log": "Revenue Size (log)",
-    "debt_ratio": "Debt-to-Revenue Ratio",
-    "working_capital_proxy": "Working Capital Health",
+    "loan_amnt": "Loan Amount",
+    "annual_inc": "Annual Income",
+    "dti": "Debt-to-Income Ratio (DTI)",
+    "delinq_2yrs": "Delinquencies (Last 2 Years)",
+    "revol_util": "Revolving Credit Utilization (%)",
+    "int_rate": "Interest Rate (%)",
+    "installment": "Monthly Installment",
+    "grade_encoded": "Credit Grade (Risk Level)",
 }
 
 # Risk interpretations for each feature direction
 FEATURE_INTERPRETATIONS = {
-    "debt_to_equity": {
-        "high": "Excessive leverage indicates over-reliance on debt financing, increasing default risk",
-        "low": "Conservative debt structure provides financial stability and repayment capacity",
+    "loan_amnt": {
+        "high": "High loan amount relative to income increases repayment burden",
+        "low": "Moderate loan amount is well-supported by borrower financials",
     },
-    "revenue_growth": {
-        "high": "Strong revenue trajectory indicates business momentum and market demand",
-        "low": "Declining or stagnant revenue signals competitive weakness or market contraction",
+    "annual_inc": {
+        "high": "Strong annual income provides a healthy cushion for debt servicing",
+        "low": "Low annual income limits the capacity to manage large debt obligations",
     },
-    "interest_coverage": {
-        "high": "Strong ability to service debt obligations from operating earnings",
-        "low": "Weak debt service coverage raises concerns about loan repayment capacity",
+    "dti": {
+        "high": "High Debt-to-Income ratio indicates the borrower is over-leveraged",
+        "low": "Low DTI ratio suggests significant disposable income for debt repayment",
     },
-    "current_ratio": {
-        "high": "Healthy short-term liquidity position to meet working capital needs",
-        "low": "Liquidity stress may lead to difficulty in meeting short-term obligations",
+    "delinq_2yrs": {
+        "high": "Recent delinquencies indicate a pattern of credit mismanagement or distress",
+        "low": "Clean delinquency record demonstrates reliable repayment behavior",
     },
-    "ebitda_margin": {
-        "high": "Strong operational profitability indicates efficient business operations",
-        "low": "Thin operating margins leave little buffer for economic downturns",
+    "revol_util": {
+        "high": "High credit card utilization signals potential liquidity stress",
+        "low": "Low utilization indicates prudent use of revolving credit lines",
     },
-    "gst_compliance_score": {
-        "high": "Excellent GST filing discipline indicates transparent revenue reporting",
-        "low": "Low GST compliance raises red flags about revenue authenticity and circular trading",
+    "int_rate": {
+        "high": "Higher interest rate reflects elevated market-perceived risk",
+        "low": "Competitive interest rate indicates a lower risk profile",
     },
-    "credit_score_normalized": {
-        "high": "Strong credit history demonstrates reliable financial behavior",
-        "low": "Poor credit history signals past defaults or payment irregularities",
+    "installment": {
+        "high": "High monthly installments may strain borrower's monthly cash flow",
+        "low": "Manageable installments reduce the likelihood of payment defaults",
     },
-    "debt_ratio": {
-        "high": "High debt relative to revenue strains cash flow capacity",
-        "low": "Low debt relative to revenue provides strong repayment buffer",
-    },
-    "working_capital_proxy": {
-        "high": "Adequate working capital cycle management",
-        "low": "Working capital stress could impact day-to-day operations",
+    "grade_encoded": {
+        "high": "Lower internal credit grade signals higher structural risk",
+        "low": "Premium credit grade reflects strong overall creditworthiness",
     },
 }
 
@@ -132,8 +126,8 @@ def _shap_explanation(
             "shap_value": round(val, 4),
             "feature_value": round(float(features.get(fname, 0.0)), 4),
             "display_name": FEATURE_DISPLAY_NAMES.get(fname, fname),
-            "direction": "positive" if val > 0 else "negative",
-            "impact": "increases_creditworthiness" if val > 0 else "decreases_creditworthiness",
+            "direction": "risk_driver" if val > 0 else "credit_driver",
+            "impact": "increases_default_risk" if val > 0 else "improves_creditworthiness",
         }
 
     # Sort by absolute SHAP value
@@ -147,10 +141,10 @@ def _shap_explanation(
         "method": "SHAP_TreeExplainer",
         "shap_values": {k: v["shap_value"] for k, v in contributions.items()},
         "feature_contributions": contributions,
-        "top_positive_factors": [
+        "top_positive_risk_drivers": [
             {"feature": k, **v} for k, v in sorted_factors if v["shap_value"] > 0
         ][:3],
-        "top_negative_factors": [
+        "top_credit_drivers": [
             {"feature": k, **v} for k, v in sorted_factors if v["shap_value"] < 0
         ][:3],
         "top_factors": [{"feature": k, **v} for k, v in top_factors],
@@ -256,11 +250,15 @@ def _generate_narrative(
         fval = fdata.get("feature_value", 0)
 
         interp = FEATURE_INTERPRETATIONS.get(fname, {})
-        if shap_val > 0:
-            explanation = interp.get("high", f"{display} contributes positively to creditworthiness")
+        if shap_val < 0:
+            # Negative SHAP reduces default probability -> Strength
+            explanation = interp.get("low" if "dti" in fname or "delinq" in fname or "util" in fname else "high", 
+                                   f"{display} contributes positively to creditworthiness")
             positive_factors.append(f"**{display}** ({fval:.2f}): {explanation}")
         else:
-            explanation = interp.get("low", f"{display} raises concerns about creditworthiness")
+            # Positive SHAP increases default probability -> Risk
+            explanation = interp.get("high" if "dti" in fname or "delinq" in fname or "util" in fname else "low", 
+                                   f"{display} raises concerns about default risk")
             negative_factors.append(f"**{display}** ({fval:.2f}): {explanation}")
 
     parts = [opening, ""]

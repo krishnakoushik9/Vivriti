@@ -1,0 +1,231 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Design System Tokens ─── */
+:root[data-theme="dark"] {
+  /* INCREASE ALL TEXT CONTRAST */
+  --text-primary:   #EDEDED;
+  --text-secondary: #A0A0A0;
+  --text-muted:     #666666;
+  --text-disabled:  #444444;
+
+  /* BORDERS — slightly more visible */
+  --border-subtle:  #222222;
+  --border-default: #2F2F2F;
+  --border-strong:  #4A4A4A;
+
+  /* SURFACES — slightly more contrast from base */
+  --bg-base:        #080808;
+  --bg-surface:     #131313;
+  --bg-elevated:    #111111;
+  --bg-hover:       #1A1A1A;
+
+  /* ACCENTS — brighter, more visible */
+  --accent-green:        #34D399;
+  --accent-green-bg:     #0A2218;
+  --accent-green-border: #1A4A30;
+  
+  --accent-amber:        #FBBF24;
+  --accent-amber-bg:     #2A1A08;
+  --accent-amber-border: #4A3010;
+  
+  --accent-red:          #F87171;
+  --accent-red-bg:       #280A0A;
+  --accent-red-border:   #4A1818;
+  
+  --accent-blue:         #60A5FA;
+  --accent-blue-bg:      #0A1628;
+  --accent-blue-border:  #1A3050;
+  
+  --accent-purple:       #C4B5FD;
+  --accent-purple-bg:    #160A2A;
+  --accent-purple-border: #2A1850;
+}
+
+:root[data-theme="light"] {
+  --bg-base:        #F0EDE6;
+  --bg-surface:     #FFFFFF;
+  --bg-elevated:    #F9FAFB;
+  --bg-hover:       #F3F4F6;
+  --border-subtle:  #F3F4F6;
+  --border-default: #E5E7EB;
+  --border-strong:  #D1D5DB;
+  
+  --text-primary:   #111827;
+  --text-secondary: #374151;
+  --text-muted:     #6B7280;
+  --text-disabled:  #9CA3AF;
+
+  --accent-green:   #16A34A;
+  --accent-green-bg: #DCFCE7;
+  --accent-green-border: #BBF7D0;
+  --accent-red:     #DC2626;
+  --accent-red-bg:  #FEE2E2;
+  --accent-red-border: #FECACA;
+  --accent-amber:   #D97706;
+  --accent-amber-bg: #FEF3C7;
+  --accent-amber-border: #FDE68A;
+  --accent-blue:    #1D4ED8;
+  --accent-blue-bg: #EFF6FF;
+  --accent-blue-border: #DBEAFE;
+  --accent-purple:  #7C3AED;
+  --accent-purple-bg: #F5F3FF;
+  --accent-purple-border: #DDD6FE;
+}
+
+:root {
+  --font-sans: var(--font-sans, 'Inter', system-ui, sans-serif);
+  --font-mono: var(--font-mono, 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace);
+}
+
+/* ─── Base Styles ─── */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  min-height: 100vh;
+  line-height: 1.5;
+  overflow-x: hidden;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.font-mono {
+  font-family: var(--font-mono) !important;
+  font-feature-settings: "liga" 1, "calt" 1;
+}
+
+[data-theme="light"] .font-mono {
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+[data-theme="dark"] .font-mono {
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+
+/* ─── Custom Scrollbar ─── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* ─── Utility Layer ─── */
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+/* ─── Component Layer ─── */
+@layer components {
+  /* ── Page shell ── */
+  .page-container {
+    @apply max-w-screen-2xl mx-auto px-[48px] py-[40px];
+  }
+
+  /* ── Card ── */
+  .card {
+    @apply bg-[var(--bg-surface)] rounded-[4px] border border-[var(--border-default)] shadow-sm;
+  }
+
+  /* ── Badge variants ── */
+  .badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-[3px] text-[11px] font-bold uppercase tracking-wider border;
+  }
+
+  /* ── Buttons ── */
+  .btn-primary {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-[4px] bg-[var(--text-primary)] text-[var(--bg-base)] font-medium text-sm hover:opacity-90 transition-colors duration-150;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-[4px] bg-[var(--bg-surface)] text-[var(--text-primary)] font-medium text-sm border border-[var(--border-default)] hover:bg-[var(--bg-hover)] transition-colors duration-150;
+  }
+
+  /* ── Form ── */
+  .input-field {
+    @apply w-full h-[40px] px-3 rounded-[4px] border border-[var(--border-default)] bg-[var(--bg-base)] text-[14px] text-[var(--text-primary)] placeholder:text-[var(--text-disabled)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors;
+  }
+}
+
+/* ─── Markdown / Report Styling ─── */
+.cam-content {
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+.cam-content h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 0.5rem;
+}
+
+.cam-content h2 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 2rem 0 0.75rem;
+}
+
+.cam-content p {
+  margin-bottom: 1rem;
+  color: var(--text-secondary);
+}
+
+.cam-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  font-size: 0.85rem;
+}
+
+.cam-content th {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-weight: 600;
+  text-align: left;
+  padding: 0.75rem;
+  border: 1px solid var(--border-default);
+}
+
+.cam-content td {
+  padding: 0.75rem;
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+}
+
+/* ─── Progress Bar ─── */
+.progress-fill {
+  transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+  background: var(--text-primary);
+}

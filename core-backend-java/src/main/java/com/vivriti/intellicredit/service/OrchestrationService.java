@@ -1,5 +1,6 @@
 package com.vivriti.intellicredit.service;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vivriti.intellicredit.entity.LoanApplication;
 import com.vivriti.intellicredit.repository.LoanApplicationRepository;
@@ -40,7 +41,11 @@ public class OrchestrationService {
     @Value("${services.bff-node.url}")
     private String bffNodeUrl;
 
-    private final WebClient webClient = WebClient.builder().build();
+    private static final Map<String, Long> recentAnalysisCalls = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private final WebClient webClient = WebClient.builder()
+            .codecs(configurer -> configurer.defaultCodecs().maxInMemorySize(10 * 1024 * 1024))
+            .build();
 
     /**
      * Main orchestration entry point
@@ -81,7 +86,29 @@ public class OrchestrationService {
             // Step 4: Update with ML output
             notifyBff(applicationId, "CRAWLING_INTELLIGENCE", "Crawling web intelligence & news feeds", 75);
 
-            double mlScore = ((Number) mlResult.getOrDefault("ml_risk_score", 50.0)).doubleValue();
+            // Parse score with multiple field fallbacks
+            Double mlScore = null;
+            if (mlResult != null) {
+                Object scoreVal = mlResult.get("ml_risk_score");
+                if (scoreVal == null) scoreVal = mlResult.get("score");
+                if (scoreVal == null) scoreVal = mlResult.get("risk_score");
+
+                if (scoreVal != null) {
+                    try {
+                        mlScore = Double.parseDouble(scoreVal.toString());
+                    } catch (NumberFormatException e) {
+                        log.warn("[ORCHESTRATOR] Could not parse score: {}", scoreVal);
+                    }
+                }
+            }
+
+            if (mlScore == null || mlScore <= 0) {
+                log.warn("[ORCHESTRATOR] Score missing from Python response, using fallback 50.0");
+                mlScore = 50.0;
+            } else {
+                log.info("[ORCHESTRATOR] Python score received: {}", mlScore);
+            }
+
             boolean anomaly = (boolean) mlResult.getOrDefault("anomaly_detected", false);
             boolean circularTrading = (boolean) mlResult.getOrDefault("circular_trading_risk", false);
             String camDocument = (String) mlResult.getOrDefault("cam_document", "CAM generation pending...");
@@ -93,6 +120,9 @@ public class OrchestrationService {
 
             // Update app with ML results
             app = repository.findByApplicationId(applicationId).get();
+            app.setMlRiskScore(java.math.BigDecimal.valueOf(mlScore)); // FIX: Set the score in entity!
+            app.setAnomalyDetected(anomaly);
+            app.setCircularTradingRisk(circularTrading);
             app.setAnomalyDetails(anomalyDetails);
             app.setSentimentScore(java.math.BigDecimal.valueOf(sentiment));
             app.setNewsIntelligenceSummary(newsIntel);
@@ -145,7 +175,8 @@ public class OrchestrationService {
         payload.put("application_id", app.getApplicationId());
         payload.put("company_name", app.getCompanyName());
         payload.put("sector", app.getSector());
-        // ML worker requires non-null numerics (FastAPI/Pydantic) — provide safe defaults
+        // ML worker requires non-null numerics (FastAPI/Pydantic) — provide safe
+        // defaults
         payload.put("debt_to_equity", app.getDebtToEquityRatio() != null ? app.getDebtToEquityRatio() : 0.0);
         payload.put("revenue_growth", app.getRevenueGrowthPercent() != null ? app.getRevenueGrowthPercent() : 0.0);
         payload.put("interest_coverage", app.getInterestCoverageRatio() != null ? app.getInterestCoverageRatio() : 0.0);
@@ -157,23 +188,49 @@ public class OrchestrationService {
         payload.put("total_debt", app.getTotalDebt() != null ? app.getTotalDebt() : 0.0);
         payload.put("credit_officer_notes", creditOfficerNotes);
 
-        // Attach uploaded document extraction payloads so the ML worker can do doc-grounded checks
-        if (app.getDocumentExtractionJson() != null && !app.getDocumentExtractionJson().isBlank()) {
-            try {
-                Object docObj = objectMapper.readValue(app.getDocumentExtractionJson(), Object.class);
-                payload.put("document_extractions", docObj);
-
-                // Doc-driven feature overrides (best-effort):
-                Map<String, Object> overrides = deriveFeatureOverridesFromDocs(docObj);
-                if (!overrides.isEmpty()) {
-                    payload.putAll(overrides);
-                    payload.put("doc_driven_features", true);
-                } else {
-                    payload.put("doc_driven_features", false);
-                }
-            } catch (Exception e) {
-                log.warn("[ORCHESTRATOR] Failed to parse documentExtractionJson: {}", e.getMessage());
+        // Attach uploaded document extraction payloads so the ML worker can do
+        // doc-grounded checks
+        if (app.getDocumentExtractionJson() != null 
+            && !app.getDocumentExtractionJson().isEmpty()) {
+          try {
+            ObjectMapper mapper = new ObjectMapper();
+            List<Map<String, Object>> extractions = mapper.readValue(
+              app.getDocumentExtractionJson(),
+              new TypeReference<List<Map<String, Object>>>() {}
+            );
+            payload.put("document_extractions", extractions);
+            
+            // Also extract key financials directly for RF model
+            if (!extractions.isEmpty()) {
+              Map<String, Object> best = extractions.stream()
+                .filter(e -> Boolean.TRUE.equals(e.get("success")))
+                .findFirst()
+                .orElse(extractions.get(0));
+              
+              Map<String, Object> structured = (Map<String, Object>) 
+                best.getOrDefault("structured_data", new HashMap<>());
+              
+              Object rev = structured.get("revenue_from_operations");
+              if (rev == null) rev = structured.get("total_revenue");
+              if (rev != null) payload.put("annual_revenue", rev);
+              
+              Object debt = structured.get("borrowings");
+              if (debt == null) debt = structured.get("total_debt");
+              if (debt != null) payload.put("total_debt", debt);
+              
+              Object de = structured.get("debt_to_asset_ratio");
+              if (de != null) payload.put("debt_to_equity", de);
+              
+              Object icr = structured.get("interest_coverage_ratio");
+              if (icr != null) payload.put("interest_coverage_ratio", icr);
+              
+              Object cr = structured.get("current_ratio");
+              if (cr != null) payload.put("current_ratio", cr);
             }
+          } catch (Exception e) {
+            log.warn("[ORCHESTRATOR] Could not parse documentExtractionJson: {}", 
+                     e.getMessage());
+          }
         }
         return payload;
     }
@@ -198,26 +255,36 @@ public class OrchestrationService {
         Map<String, Object> incomeStatement = firstStructuredData(docs, "income_statement");
         Map<String, Object> gstReturn = firstStructuredData(docs, "gst_return");
 
-        // Annual revenue: prefer Income Statement total_revenue → revenue_from_operations → GST taxable_value
+        // Annual revenue: prefer Income Statement total_revenue →
+        // revenue_from_operations → GST taxable_value
         Double totalRevenue = getDouble(incomeStatement, "total_revenue");
-        if (totalRevenue == null) totalRevenue = getDouble(incomeStatement, "revenue_from_operations");
-        if (totalRevenue == null) totalRevenue = getDouble(gstReturn, "taxable_value");
-        if (totalRevenue != null && totalRevenue > 0) overrides.put("annual_revenue", totalRevenue);
+        if (totalRevenue == null)
+            totalRevenue = getDouble(incomeStatement, "revenue_from_operations");
+        if (totalRevenue == null)
+            totalRevenue = getDouble(gstReturn, "taxable_value");
+        if (totalRevenue != null && totalRevenue > 0)
+            overrides.put("annual_revenue", totalRevenue);
 
-        // Total debt: prefer Balance Sheet borrowings → total_liabilities (as a fallback proxy)
+        // Total debt: prefer Balance Sheet borrowings → total_liabilities (as a
+        // fallback proxy)
         Double borrowings = getDouble(balanceSheet, "borrowings");
-        if (borrowings == null) borrowings = getDouble(balanceSheet, "total_liabilities");
-        if (borrowings != null && borrowings > 0) overrides.put("total_debt", borrowings);
+        if (borrowings == null)
+            borrowings = getDouble(balanceSheet, "total_liabilities");
+        if (borrowings != null && borrowings > 0)
+            overrides.put("total_debt", borrowings);
 
         // Ratios / margins
         Double currentRatio = getDouble(balanceSheet, "current_ratio");
-        if (currentRatio != null && currentRatio > 0) overrides.put("current_ratio", currentRatio);
+        if (currentRatio != null && currentRatio > 0)
+            overrides.put("current_ratio", currentRatio);
 
         Double icr = getDouble(incomeStatement, "interest_coverage_ratio");
-        if (icr != null && icr > 0) overrides.put("interest_coverage", icr);
+        if (icr != null && icr > 0)
+            overrides.put("interest_coverage", icr);
 
         Double ebitdaMargin = getDouble(incomeStatement, "ebitda_margin");
-        if (ebitdaMargin != null) overrides.put("ebitda_margin", ebitdaMargin);
+        if (ebitdaMargin != null)
+            overrides.put("ebitda_margin", ebitdaMargin);
 
         // Debt-to-equity: if equity present and borrowings present
         Double equity = getDouble(balanceSheet, "shareholders_equity");
@@ -231,7 +298,7 @@ public class OrchestrationService {
     private Map<String, Object> firstStructuredData(List<Map<String, Object>> docs, String docType) {
         for (Map<String, Object> d : docs) {
             if (docType.equals(d.get("document_type")) && d.get("structured_data") instanceof Map) {
-                //noinspection unchecked
+                // noinspection unchecked
                 return (Map<String, Object>) d.get("structured_data");
             }
         }
@@ -239,9 +306,11 @@ public class OrchestrationService {
     }
 
     private Double getDouble(Map<String, Object> m, String key) {
-        if (m == null) return null;
+        if (m == null)
+            return null;
         Object v = m.get(key);
-        if (v instanceof Number) return ((Number) v).doubleValue();
+        if (v instanceof Number)
+            return ((Number) v).doubleValue();
         if (v instanceof String s) {
             try {
                 return Double.parseDouble(s.replace(",", "").trim());
@@ -254,6 +323,21 @@ public class OrchestrationService {
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> callPythonWorker(Map<String, Object> payload) {
+        String appId = (String) payload.get("application_id");
+        long now = System.currentTimeMillis();
+
+        // Clear entries older than 5 minutes to prevent memory leak
+        recentAnalysisCalls.entrySet().removeIf(e -> now - e.getValue() > 300_000);
+
+        // Dedup guard — skip if called within 30s
+        Long lastCall = recentAnalysisCalls.get(appId);
+        if (lastCall != null && now - lastCall < 30_000) {
+            log.warn("[DEDUP] Skipping duplicate /analyze for {} (called {}ms ago)",
+                    appId, now - lastCall);
+            return getFallbackResult();
+        }
+        recentAnalysisCalls.put(appId, now);
+
         try {
             String serviceToken = jwtTokenUtil.generateServiceToken("java-core-backend");
             Map<String, Object> result = webClient.post()

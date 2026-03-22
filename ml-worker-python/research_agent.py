@@ -16,8 +16,53 @@ from typing import Dict, Any, List, Optional
 
 import requests
 import subprocess
+import asyncio
 
 logger = logging.getLogger("intellicredit.research_agent")
+
+# ─────────────────────────────────────────────
+# Import new modular components (drop-in ready)
+# ─────────────────────────────────────────────
+try:
+    from api_client import NewsAPIClient, GDELTClient
+except ImportError:
+    NewsAPIClient = None  # type: ignore
+    GDELTClient = None  # type: ignore
+
+try:
+    from scraper import (
+        google_news_rss,
+        indian_kanoon_search,
+        economic_times_rss,
+        mint_rss,
+        business_standard_rss,
+        moneycontrol_rss,
+        duckduckgo_search as _scraper_ddg,
+        fetch_page_text as _scraper_fetch,
+    )
+except ImportError:
+    google_news_rss = None  # type: ignore
+    indian_kanoon_search = None  # type: ignore
+    _scraper_ddg = None
+    _scraper_fetch = None
+
+try:
+    from risk_analyzer import (
+        deduplicate_articles,
+        analyze_research_results as _enhanced_analyze,
+        score_article as _enhanced_score,
+        RISK_WEIGHTS as _ENHANCED_WEIGHTS,
+    )
+except ImportError:
+    deduplicate_articles = None  # type: ignore
+    _enhanced_analyze = None
+    _enhanced_score = None
+    _ENHANCED_WEIGHTS = None
+
+try:
+    from aggregator import aggregate
+except ImportError:
+    aggregate = None  # type: ignore
 
 _CACHE: Dict[str, Any] = {}
 _CACHE_TTL_S = 60 * 60  # 1 hour
@@ -258,6 +303,14 @@ def analyze_gst_reconciliation(revenue: float, gst_compliance_score: float) -> D
     Deterministic placeholder for GST ↔ revenue reconciliation.
     When GST/bank docs are uploaded, this will be replaced with doc-grounded reconciliation.
     """
+    if not revenue or not gst_compliance_score:
+        return {
+            "status": "DATA_NOT_FOUND",
+            "gstr_3b_vs_bank": "0.0% variance (missing data)",
+            "circular_trading_risk": "UNKNOWN",
+            "details": "Insufficient GST or revenue data found for reconciliation. Marking as DATA_NOT_FOUND to avoid false triggers.",
+        }
+
     score = float(gst_compliance_score or 0.0)
     if score < 35:
         variance = 0.45
@@ -291,14 +344,36 @@ def check_mca_filings(company_name: str) -> Dict[str, Any]:
     results = duckduckgo_search(query, max_results=5)
     citations = [{"title": r.title, "url": r.url, "snippet": r.snippet} for r in results]
 
-    # Conservative heuristic: we do NOT claim compliance without official data.
-    status = "UNKNOWN_PUBLIC_DATA"
-    details = "Public web search performed; official MCA21 compliance requires authenticated lookup (CIN + filings)."
+    # Parse snippets for status keywords
+    status_keywords = {
+        "amalgamated": "AMALGAMATED",
+        "struck off": "STRUCK_OFF",
+        "dissolved": "DISSOLVED",
+        "liquidated": "LIQUIDATED",
+        "under liquidation": "LIQUIDATION",
+    }
+    
+    found_status = None
+    for r in results:
+        text = (r.title + " " + r.snippet).lower()
+        for kw, val in status_keywords.items():
+            if kw in text:
+                found_status = val
+                break
+        if found_status:
+            break
+
+    if found_status:
+        status = "MAPPING_SUCCESS"
+        details = f"Public references indicate company status: {found_status}. MCA compliance check results reflect this status."
+    else:
+        status = "UNKNOWN_PUBLIC_DATA"
+        details = "Public web search performed; official MCA21 compliance requires authenticated lookup (CIN + filings)."
 
     return {
         "status": status,
         "directors_active": None,
-        "strike_off_warning": None,
+        "strike_off_warning": (True if found_status in ["STRUCK_OFF", "DISSOLVED"] else False),
         "details": details,
         "citations": citations,
     }
@@ -423,61 +498,10 @@ def gather_news(company_name: str, max_items: int = 8) -> Dict[str, Any]:
     return {"summary": summary, "items": items}
 
 
-def gdelt_news_search(company_name: str, max_items: int = 8, timeout_s: int = 15) -> List[Dict[str, Any]]:
-    """
-    Query GDELT 2.1 DOC API for recent articles about the company.
-    No API key required. Returns [{title,url,snippet,source,published_at}].
-    """
-    q = (company_name or "").strip()
-    if not q:
-        return []
-
-    cache_key = f"gdelt::{q.lower()}::{max_items}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    url = "https://api.gdeltproject.org/api/v2/doc/doc"
-    params = {
-        "query": f"\"{q}\"",
-        "mode": "ArtList",
-        "format": "json",
-        "maxrecords": str(max(1, min(20, max_items))),
-        "sort": "HybridRel",
-        "formatdatetime": "1",
-    }
-    headers = {"User-Agent": "IntelliCreditResearch/1.0"}
-    try:
-        _jitter_sleep()
-        r = requests.get(url, params=params, headers=_headers(), timeout=timeout_s, proxies=_proxies())
-        if r.status_code == 429:
-            logger.warning("GDELT rate-limited (429). Falling back.")
-            _cache_set(cache_key, [])
-            return []
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        logger.warning("GDELT search failed: %s", e)
-        _cache_set(cache_key, [])
-        return []
-
-    articles = data.get("articles") or []
-    out: List[Dict[str, Any]] = []
-    for a in articles:
-        title = _clean_text(a.get("title") or "")
-        link = _clean_text(a.get("url") or "")
-        if not title or not link:
-            continue
-        out.append({
-            "title": title,
-            "url": link,
-            "snippet": _clean_text(a.get("seendate") or a.get("sourceCountry") or ""),
-            "source": a.get("sourceCollection") or a.get("sourceCountry") or None,
-            "published_at": a.get("seendate") or None,
-        })
-        if len(out) >= max_items:
-            break
-    return out
+def gdelt_news_search(company_name, max_items=8):
+    """Shim for backward compatibility."""
+    from api_client import GDELTClient
+    return GDELTClient().search(company_name, max_items=max_items)
 
 
 def wikipedia_sources(company_name: str, max_items: int = 5, timeout_s: int = 10) -> List[Dict[str, Any]]:
@@ -518,6 +542,7 @@ def wikipedia_sources(company_name: str, max_items: int = 5, timeout_s: int = 10
             "url": f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
             "snippet": _clean_text(re.sub(r"<.*?>", "", it.get("snippet") or "")),
             "source": "wikipedia",
+            "source_type": "reference",
             "published_at": None,
         })
     _cache_set(cache_key, out)
@@ -679,3 +704,411 @@ def analyze_research_results(articles: list) -> dict:
         "all_risk_keywords": all_keywords,
         "overall_risk_level": ("CRITICAL" if critical else "HIGH" if high else "MEDIUM" if medium else "LOW"),
     }
+
+
+# ═════════════════════════════════════════════════════════════
+# UNIFIED ENTRY POINT — call this from Java ML worker
+# ═════════════════════════════════════════════════════════════
+
+async def run_research(
+    company_name: str,
+    promoters: list = None,
+    cin: str = None,
+    revenue: float = 0.0,
+    gst_score: float = 0.0,
+    base_credit_score: int = 650,
+    progress_callback=None,
+) -> dict:
+    """
+    HYBRID PIPELINE — unified research entry point.
+
+    Step 1:  PRIMARY   — NewsAPI search_everything()
+    Step 2:  PRIMARY   — gdelt_news_search() (existing)
+    Step 3:  GATE      — if total unique articles < 3 → trigger fallback
+    Step 4:  FALLBACK  — google_news_rss(), indian_kanoon_search(), duckduckgo_search()
+    Step 5:  BFF       — Node BFF gather_news() (always run, merge results)
+    Step 6:  DEDUP     — risk_analyzer.deduplicate_articles()
+    Step 7:  SCORE     — risk_analyzer.analyze_research_results()
+    Step 8:  SUPPLEMENTAL — conduct_full_research() for MCA/CIBIL/eCourts/GST
+    Step 9:  AGGREGATE — aggregator.aggregate()
+    Step 10: RETURN    — final dict
+
+    MUST NOT raise exceptions. On catastrophic failure returns error dict.
+    """
+    try:
+        company_name = (company_name or "").strip()
+        if not company_name:
+            return {
+                "company": company_name,
+                "error": "Empty company name",
+                "overall_risk_level": "UNKNOWN",
+            }
+
+        promoters = promoters or []
+        all_articles: list = []
+
+        # ── Step 0: RSS sources (free, no limits) ──
+        if progress_callback:
+            progress_callback("newsapi", "Scanning news feeds...")
+        logger.info("Step 0: RSS scraping for '%s'", company_name)
+        try:
+            from scraper import (
+                economic_times_rss, mint_rss,
+                business_standard_rss, moneycontrol_rss
+            )
+            for rss_fn, src_name in [
+                (economic_times_rss,   "Economic Times"),
+                (mint_rss,             "Mint"),
+                (business_standard_rss,"Business Standard"),
+                (moneycontrol_rss,     "MoneyControl"),
+            ]:
+                try:
+                    items = rss_fn(company_name, max_items=8)
+                    all_articles.extend(items)
+                    logger.info("%s RSS returned %d items",
+                                src_name, len(items))
+                except Exception as e:
+                    logger.warning("%s RSS failed: %s", src_name, e)
+        except Exception as e:
+            logger.warning("RSS scraping block failed: %s", e)
+
+        # ── Step 1: NewsAPI (primary) ─────────────────
+        if progress_callback:
+            progress_callback("newsapi", "Fetching NewsAPI articles...")
+        logger.info("Step 1: NewsAPI search for '%s'", company_name)
+        if NewsAPIClient is not None:
+            try:
+                client = NewsAPIClient()
+                api_articles = client.search_everything(
+                    company_name, promoters=promoters, from_days_ago=28
+                )
+                headlines = client.get_top_headlines(company_name)
+                all_articles.extend(api_articles)
+                all_articles.extend(headlines)
+                logger.info(
+                    "NewsAPI returned %d + %d articles",
+                    len(api_articles), len(headlines),
+                )
+            except Exception as e:
+                logger.warning("NewsAPI step failed: %s", e)
+        else:
+            logger.info("NewsAPIClient not available — skipping")
+
+        # ── Step 2: GDELT (primary) ───────────────────
+        if progress_callback:
+            progress_callback("gdelt", "Querying GDELT intelligence...")
+        logger.info("Step 2: GDELT search for '%s'", company_name)
+        try:
+            if GDELTClient is not None:
+                gdelt_articles = GDELTClient().search(company_name, promoters=promoters, max_items=8)
+            else:
+                gdelt_articles = gdelt_news_search(company_name, max_items=8)
+
+            all_articles.extend(gdelt_articles)
+            logger.info("GDELT returned %d articles", len(gdelt_articles))
+        except Exception as e:
+            logger.warning("GDELT step failed: %s", e)
+
+        # ── Step 3: Gate check ────────────────────────
+        if progress_callback:
+            progress_callback("gate_check", "Checking article threshold...")
+        unique_urls = set(
+            (a.get("url") or "").strip().lower()
+            for a in all_articles if a.get("url")
+        )
+        needs_fallback = len(unique_urls) < 3
+        logger.info(
+            "Gate: %d unique URLs → fallback %s",
+            len(unique_urls),
+            "TRIGGERED" if needs_fallback else "not needed",
+        )
+
+        # ── Step 4: Fallback scrapers (if needed) ─────
+        if needs_fallback:
+            if progress_callback:
+                progress_callback("fallback", "Triggering fallback scraper...")
+            # 4a. Google News RSS
+            if google_news_rss is not None:
+                try:
+                    rss_articles = google_news_rss(
+                        company_name, max_items=10
+                    )
+                    all_articles.extend(rss_articles)
+                    logger.info("Google News RSS returned %d items", len(rss_articles))
+                except Exception as e:
+                    logger.warning("Google News RSS fallback failed: %s", e)
+
+            # 4b. Indian Kanoon for company + each promoter
+            if indian_kanoon_search is not None:
+                try:
+                    kanoon_results = indian_kanoon_search(company_name, max_items=5)
+                    all_articles.extend(kanoon_results)
+                    logger.info("Indian Kanoon (company) returned %d items", len(kanoon_results))
+                except Exception as e:
+                    logger.warning("Indian Kanoon (company) failed: %s", e)
+
+                for promoter in promoters[:3]:  # limit to first 3 promoters
+                    try:
+                        p_results = indian_kanoon_search(promoter, max_items=3)
+                        for pr in p_results:
+                            pr["subject"] = "promoter"
+                            pr["promoter_name"] = promoter
+                        all_articles.extend(p_results)
+                        logger.info("Indian Kanoon (promoter: %s) returned %d items", promoter, len(p_results))
+                    except Exception as e:
+                        logger.warning("Indian Kanoon (promoter: %s) failed: %s", promoter, e)
+
+            # 4c. DuckDuckGo as last resort
+            try:
+                ddg_func = _scraper_ddg or duckduckgo_search
+                ddg_results = ddg_func(f"{company_name} fraud OR NCLT OR SEBI", max_results=6)
+                for sr in ddg_results:
+                    if hasattr(sr, "title"):
+                        all_articles.append({
+                            "title": sr.title,
+                            "url": sr.url,
+                            "snippet": sr.snippet,
+                            "source": "duckduckgo",
+                            "source_type": "scraped",
+                        })
+                    elif isinstance(sr, dict):
+                        sr["source_type"] = sr.get("source_type", "scraped")
+                        all_articles.append(sr)
+                logger.info("DuckDuckGo fallback returned %d items", len(ddg_results))
+            except Exception as e:
+                logger.warning("DuckDuckGo fallback failed: %s", e)
+
+        # ── Step 5: Node BFF (always run, merge) ──────
+        if progress_callback:
+            progress_callback("bff", "Fetching Node BFF results...")
+        logger.info("Step 5: Node BFF gather_news for '%s'", company_name)
+        try:
+            bff_pack = gather_news(company_name, max_items=8)
+            bff_items = bff_pack.get("items", [])
+            for item in bff_items:
+                if isinstance(item, dict):
+                    item["source_type"] = "bff"
+                    all_articles.append(item)
+            logger.info("BFF returned %d items", len(bff_items))
+        except Exception as e:
+            logger.warning("BFF gather_news failed: %s", e)
+
+        # ── BONUS: Promoter-specific search ───────────
+        if promoters and NewsAPIClient is not None:
+            try:
+                client = NewsAPIClient()
+                for promoter in promoters[:3]:
+                    try:
+                        p_articles = client.search_everything(
+                            promoter, from_days_ago=90, page_size=5
+                        )
+                        for pa in p_articles:
+                            pa["subject"] = "promoter"
+                            pa["promoter_name"] = promoter
+                        all_articles.extend(p_articles)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+
+        # ── Step 6: Deduplication ─────────────────────
+        if progress_callback:
+            progress_callback("dedup", "Deduplicating sources...")
+        logger.info("Step 6: Deduplicating %d total articles", len(all_articles))
+        if deduplicate_articles is not None:
+            deduped = deduplicate_articles(all_articles)
+        else:
+            # Simple URL-based dedup fallback
+            seen: set = set()
+            deduped = []
+            for a in all_articles:
+                u = (a.get("url") or "").strip().lower()
+                if u and u in seen:
+                    continue
+                if u:
+                    seen.add(u)
+                deduped.append(a)
+        logger.info("After dedup: %d articles", len(deduped))
+
+        # ── Step 7: Score all articles ────────────────
+        if progress_callback:
+            progress_callback("scoring", "Scoring risk signals...")
+        logger.info("Step 7: Scoring articles")
+        score_fn = _enhanced_analyze or analyze_research_results
+        scored_result = score_fn(deduped)
+        scored_articles = scored_result.get("articles", deduped)
+
+        # ── Step 8: Supplemental signals ──────────────
+        logger.info("Step 8: conduct_full_research() for supplemental signals")
+        try:
+            supplemental = conduct_full_research(
+                company_name, revenue, gst_score, base_credit_score
+            )
+        except Exception as e:
+            logger.warning("conduct_full_research failed: %s", e)
+            supplemental = {}
+
+        # ── Step 9: Aggregate ─────────────────────────
+        if progress_callback:
+            progress_callback("aggregating", "Aggregating intelligence...")
+        logger.info("Step 9: Final aggregation")
+        if aggregate is not None:
+            final = aggregate(company_name, scored_articles, supplemental)
+        else:
+            # Minimal fallback aggregation
+            final = {
+                "company": company_name,
+                "total_articles": len(scored_articles),
+                "overall_risk_level": scored_result.get("overall_risk_level", "UNKNOWN"),
+                "articles": scored_articles,
+                "supplemental": supplemental,
+                **{k: v for k, v in scored_result.items() if k != "articles"},
+            }
+
+        logger.info(
+            "run_research complete for '%s': %d articles, level=%s",
+            company_name,
+            final.get("total_articles", 0),
+            final.get("overall_risk_level", "UNKNOWN"),
+        )
+        return final
+
+    except Exception as e:
+        logger.error("run_research CATASTROPHIC failure for '%s': %s", company_name, e, exc_info=True)
+        return {
+            "company": company_name,
+            "error": str(e),
+            "overall_risk_level": "UNKNOWN",
+        }
+
+
+# ── Sync wrapper for backward compat (Java ML worker bridge) ──
+def run_research_sync(
+    company_name: str,
+    promoters: list = None,
+    cin: str = None,
+    revenue: float = 0.0,
+    gst_score: float = 0.0,
+    base_credit_score: int = 650,
+) -> dict:
+    """
+    Synchronous wrapper around run_research() for Java ML worker bridge.
+    Uses asyncio.run() — safe to call from synchronous code.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Already in an async context — create a new thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                asyncio.run,
+                run_research(
+                    company_name, promoters, cin,
+                    revenue, gst_score, base_credit_score,
+                ),
+            )
+            return future.result(timeout=120)
+    else:
+        return asyncio.run(
+            run_research(
+                company_name, promoters, cin,
+                revenue, gst_score, base_credit_score,
+            )
+        )
+
+
+# ═════════════════════════════════════════════════════════════
+# SAMPLE OUTPUT (not live data)
+# ═════════════════════════════════════════════════════════════
+# Simulated output for: run_research("Reliance Industries")
+#
+# {
+#   "company": "Reliance Industries",
+#   "timestamp": "2026-03-20T06:23:00+00:00",
+#   "total_articles": 12,
+#   "avg_risk_score": 18.4,
+#   "confidence_avg": 0.72,
+#   "overall_risk_level": "MEDIUM",
+#   "top_risks": ["SEBI notice", "default", "promoter pledge", "restructured", "related party"],
+#   "risk_breakdown": {"critical": 0, "high": 2, "medium": 4, "low": 6},
+#   "source_mix": {"api": 6, "scraped": 3, "bff": 2, "reference": 1},
+#   "supplemental": {
+#     "mca_status": {"status": "UNKNOWN_PUBLIC_DATA", "directors_active": null, "strike_off_warning": null},
+#     "cibil_commercial": {"cmr_rank": "CMR-4", "credit_score": 720, "dpd_30_plus": 0, "dpd_90_plus": 0},
+#     "ecourts_litigation": {"litigation_found": true, "active_cases": null, "nclt_petitions": null},
+#     "gst_reconciliation": {"status": "MATCHED", "circular_trading_risk": "LOW"}
+#   },
+#   "articles": [
+#     {
+#       "title": "SEBI issues notice to Reliance Industries over delayed disclosures",
+#       "url": "https://economictimes.com/markets/sebi-ril-notice-2026.cms",
+#       "snippet": "SEBI has issued a show cause notice to Reliance Industries Ltd for delayed...",
+#       "source": "Economic Times",
+#       "published_at": "2026-03-18T10:30:00+05:30",
+#       "source_type": "api",
+#       "risk_score": 28,
+#       "risk_level": "HIGH",
+#       "risk_flags": ["SEBI notice", "show cause"],
+#       "confidence": 0.9
+#     },
+#     {
+#       "title": "RIL subsidiary faces NCLT petition from vendor",
+#       "url": "https://livemint.com/companies/ril-nclt-petition.html",
+#       "snippet": "A vendor has filed an insolvency petition against a Reliance subsidiary...",
+#       "source": "Mint",
+#       "published_at": "2026-03-15T14:20:00+05:30",
+#       "source_type": "api",
+#       "risk_score": 34,
+#       "risk_level": "HIGH",
+#       "risk_flags": ["NCLT", "insolvency"],
+#       "confidence": 0.8
+#     },
+#     {
+#       "title": "Reliance Industries Q3 results beat Street estimates",
+#       "url": "https://moneycontrol.com/news/ril-q3-results.html",
+#       "snippet": "Reliance Industries reported a 12% YoY increase in consolidated net profit...",
+#       "source": "MoneyControl",
+#       "published_at": "2026-03-10T09:00:00+05:30",
+#       "source_type": "api",
+#       "risk_score": 0,
+#       "risk_level": "NONE",
+#       "risk_flags": [],
+#       "confidence": 0.7
+#     },
+#     {
+#       "title": "Promoter pledge in Reliance group arm increases marginally",
+#       "url": "https://business-standard.com/ril-promoter-pledge-2026.html",
+#       "snippet": "Promoter pledge ratio in a Reliance group subsidiary rose by 0.3%...",
+#       "source": "Business Standard",
+#       "published_at": "2026-03-05T11:15:00+05:30",
+#       "source_type": "scraped",
+#       "risk_score": 8,
+#       "risk_level": "MEDIUM",
+#       "risk_flags": ["promoter pledge"],
+#       "confidence": 0.7
+#     },
+#     {
+#       "title": "Reliance Industries Ltd vs Commissioner of GST - Indian Kanoon",
+#       "url": "https://indiankanoon.org/doc/12345678/",
+#       "snippet": "High Court of Bombay. Reliance Industries Ltd challenged the GST assessment...",
+#       "source": "indiankanoon",
+#       "published_at": null,
+#       "source_type": "scraped",
+#       "risk_score": 12,
+#       "risk_level": "MEDIUM",
+#       "risk_flags": ["GST fraud"],
+#       "confidence": 0.8
+#     }
+#   ],
+#   "top_alerts": [...],
+#   "citations": [
+#     {"title": "SEBI issues notice to Reliance Industries...", "url": "https://economictimes.com/...", "source": "Economic Times"},
+#     {"title": "RIL subsidiary faces NCLT petition...", "url": "https://livemint.com/...", "source": "Mint"}
+#   ]
+# }
+

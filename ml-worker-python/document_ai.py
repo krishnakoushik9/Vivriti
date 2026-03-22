@@ -110,6 +110,40 @@ DOCUMENT_SIGNATURES = {
     ],
 }
 
+GEMINI_VISION_PROMPT = """You are a financial data extraction
+specialist. These images are pages from an Indian company
+financial statement (P&L, balance sheet, annual report).
+
+The document may be scanned, low quality, mixed Hindi/English,
+or contain rubber stamps. Ignore stamps and handwriting.
+
+Return ONLY valid JSON. No explanation. No markdown fences.
+If a value is not found, use null.
+
+Rules:
+- Do NOT pick up note numbers or page numbers as values
+- Revenue must be > 1000 if in Lakhs, > 10 if in Crores
+- Set unit_scale based on document header declaration
+
+{
+  "unit_scale": "lakhs|crores|absolute|unknown",
+  "revenue_from_operations": null,
+  "total_revenue": null,
+  "ebitda": null,
+  "profit_before_tax": null,
+  "profit_after_tax": null,
+  "total_debt": null,
+  "total_equity": null,
+  "total_assets": null,
+  "current_assets": null,
+  "current_liabilities": null,
+  "interest_expense": null,
+  "depreciation": null,
+  "revenue_growth_pct": null,
+  "company_name": null,
+  "financial_year": null
+}"""
+
 def classify_document(text: str) -> Dict[str, Any]:
     """
     Classify a financial document based on keyword matching.
@@ -154,8 +188,16 @@ def extract_text_from_pdf(file_path: str) -> Dict[str, Any]:
         full_text = []
         scanned_pages = 0
         ocr_used_pages = 0
+        total_doc_pages = len(doc)
 
-        for page_num in range(len(doc)):
+        # Optimization for large annual reports (100+ pages)
+        # Scan first 50 and last 20 pages where financial data resides
+        pages_to_scan = range(total_doc_pages)
+        if total_doc_pages > 80:
+            logger.info(f"Large document detected ({total_doc_pages} pages). Limiting text scan to first 50 and last 20.")
+            pages_to_scan = list(range(50)) + list(range(total_doc_pages - 20, total_doc_pages))
+
+        for page_num in pages_to_scan:
             page = doc[page_num]
             text = page.get_text("text")
             used_ocr = False
@@ -273,7 +315,15 @@ def extract_tables_from_pdf(file_path: str) -> Dict[str, Any]:
     try:
         tables_found = []
         with pdfplumber.open(file_path) as pdf:
-            for page_num, page in enumerate(pdf.pages):
+            total_doc_pages = len(pdf.pages)
+            # Table extraction is slow; limit scan for large documents
+            pages_to_scan = range(total_doc_pages)
+            if total_doc_pages > 40:
+                logger.info(f"Large document ({total_doc_pages} pages). Limiting table scan to first 25 and last 15.")
+                pages_to_scan = list(range(25)) + list(range(total_doc_pages - 15, total_doc_pages))
+
+            for page_num in pages_to_scan:
+                page = pdf.pages[page_num]
                 page_tables = page.extract_tables()
                 for table_idx, table in enumerate(page_tables or []):
                     if not table or len(table) < 2:
@@ -312,28 +362,93 @@ def extract_tables_from_pdf(file_path: str) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────
 # FINANCIAL STATEMENT PARSERS
 # ─────────────────────────────────────────────────────────────────
-def _extract_amount(text: str, label: str) -> Optional[float]:
-    """Extract a monetary amount near a label in the text."""
+def detect_document_unit_scale(text: str) -> float:
+    """
+    Scan the full document text for a unit declaration.
+    Return the multiplier to convert stated values to absolute INR (rupees).
+    """
+    patterns = [
+        (r'\bin\s+crore', 10_000_000),
+        (r'\bfigures\s+in\s+crore', 10_000_000),
+        (r'\bin\s+lakh', 100_000),
+        (r'\bamount\s+in\s+lakh', 100_000),
+        (r'₹\s*in\s+lakh', 100_000),
+        (r'rs\.?\s*in\s+lakh', 100_000),
+        (r'\bin\s+million', 1_000_000),
+        (r'\bin\s+thousand', 1_000),
+    ]
+    text_lower = text.lower()
+    for pattern, multiplier in patterns:
+        if re.search(pattern, text_lower):
+            logger.info(f"Document unit scale detected: {multiplier}")
+            return multiplier
+    logger.warning("No unit scale declaration found in document.")
+    return 1.0
+
+
+def _extract_amount(text: str, label: str) -> Tuple[Optional[float], bool]:
+    """
+    Extract a monetary amount near a label in the text.
+    Returns (value, locally_scaled_flag).
+    """
     patterns = [
         rf"{re.escape(label)}\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d+)?)\s*(?:crore|cr|lakh|lac|lakhs)?",
         rf"{re.escape(label)}\s*[:\-]?\s*\(?\s*([\d,]+(?:\.\d+)?)\s*\)?",
     ]
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
             amount_str = match.group(1).replace(",", "")
             try:
                 amount = float(amount_str)
-                # Check for crore/lakh suffix
-                context = text[match.start():match.end() + 20].lower()
+                
+                # BUG 1 FIX — REJECTION RULES
+                # 1. Value < 100 (note numbers, page numbers)
+                if amount < 100:
+                    continue
+                # 2. Value > 99,999,999 (likely raw paise)
+                if amount > 99_999_999:
+                    continue
+                
+                # 3. Parentheses note check: (Note 19)
+                # pattern: r'\((?:Note|note|NOTE)\s*\d+\)'
+                sub_text = text[match.start():match.end() + 15]
+                if re.search(r'\((?:Note|note|NOTE)\s*\d+\)', sub_text, re.IGNORECASE):
+                    continue
+
+                # 4. "Note" before the number
+                pre_text = text[max(0, match.start() - 15):match.start()].lower()
+                if "note" in pre_text:
+                    continue
+
+                # Check for crore/lakh suffix - WIDENED WINDOW to 60 chars
+                locally_scaled = False
+                context = text[match.start():match.end() + 60].lower()
                 if "crore" in context or "cr" in context:
                     amount *= 10_000_000
+                    locally_scaled = True
                 elif "lakh" in context or "lac" in context:
                     amount *= 100_000
-                return amount
+                    locally_scaled = True
+                
+                return amount, locally_scaled
             except ValueError:
                 continue
-    return None
+    return None, False
+
+
+def _safe_margin(numerator: Optional[float], denominator: Optional[float], label: str = "margin") -> Optional[float]:
+    """Safety guard for ratio/margin calculations."""
+    if denominator is None or denominator == 0 or numerator is None:
+        return None
+    result = (numerator / denominator) * 100
+    if result > 500:
+        logger.error(
+            f"{label} calculation produced {result:.1f}% — "
+            f"numerator={numerator}, denominator={denominator}. "
+            f"Discarding as implausible."
+        )
+        return None
+    return round(result, 2)
 
 
 def parse_balance_sheet(tables: List[Dict], text: str) -> Dict[str, Any]:
@@ -341,6 +456,7 @@ def parse_balance_sheet(tables: List[Dict], text: str) -> Dict[str, Any]:
     Parse balance sheet data from extracted tables and text.
     Returns structured financial data.
     """
+    doc_scale = detect_document_unit_scale(text)
     result = {
         "total_assets": None,
         "total_liabilities": None,
@@ -378,8 +494,10 @@ def parse_balance_sheet(tables: List[Dict], text: str) -> Dict[str, Any]:
 
     for field, labels in label_map.items():
         for label in labels:
-            value = _extract_amount(text, label)
+            value, locally_scaled = _extract_amount(text, label)
             if value is not None:
+                if not locally_scaled:
+                    value *= doc_scale
                 result[field] = value
                 break
 
@@ -411,6 +529,7 @@ def parse_income_statement(tables: List[Dict], text: str) -> Dict[str, Any]:
     Parse income statement / P&L data.
     Returns structured revenue, cost, and profitability data.
     """
+    doc_scale = detect_document_unit_scale(text)
     result = {
         "revenue_from_operations": None,
         "other_income": None,
@@ -443,16 +562,18 @@ def parse_income_statement(tables: List[Dict], text: str) -> Dict[str, Any]:
 
     for field, labels in label_map.items():
         for label in labels:
-            value = _extract_amount(text, label)
+            value, locally_scaled = _extract_amount(text, label)
             if value is not None:
+                if not locally_scaled:
+                    value *= doc_scale
                 result[field] = value
                 break
 
     # Derive metrics
     if result["total_revenue"] and result["ebitda"]:
-        result["ebitda_margin"] = round((result["ebitda"] / result["total_revenue"]) * 100, 2)
+        result["ebitda_margin"] = _safe_margin(result["ebitda"], result["total_revenue"], "ebitda_margin")
     if result["total_revenue"] and result["profit_after_tax"]:
-        result["net_profit_margin"] = round((result["profit_after_tax"] / result["total_revenue"]) * 100, 2)
+        result["net_profit_margin"] = _safe_margin(result["profit_after_tax"], result["total_revenue"], "net_profit_margin")
     if result["ebitda"] and result["interest_expense"] and result["interest_expense"] > 0:
         result["interest_coverage_ratio"] = round(result["ebitda"] / result["interest_expense"], 2)
 
@@ -791,6 +912,165 @@ def parse_itr(tables: List[Dict], text: str) -> Dict[str, Any]:
         out["filing_date"] = m.group(2)
 
     return out
+
+
+
+def is_scanned_pdf(pdf_bytes: bytes, 
+                   text_threshold: int = 100) -> bool:
+    """
+    Returns True if the PDF has no extractable text
+    (i.e. it is a scanned image, not a digital PDF).
+    Checks first 3 pages only for speed.
+    """
+    import fitz
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_text = ""
+    for i, page in enumerate(doc):
+        if i >= 3:
+            break
+        total_text += page.get_text("text").strip()
+    doc.close()
+    return len(total_text) < text_threshold
+
+
+def pdf_pages_to_images(
+    pdf_bytes: bytes,
+    dpi: int = 300,
+    max_pages: int = 10
+) -> list:
+    """
+    Renders each PDF page as a PNG image at 300 DPI.
+    Returns list of raw PNG bytes, one per page.
+    300 DPI is required for Indian scans —
+    lower DPI causes Gemini to miss small print.
+    """
+    import fitz
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    images = []
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    for i, page in enumerate(doc):
+        if i >= max_pages:
+            break
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+        images.append(pix.tobytes("png"))
+    doc.close()
+    return images
+
+
+async def extract_financials_via_gemini_vision(
+    page_images: list,
+) -> dict:
+    """
+    Calls Gemini Vision via direct HTTP — no SDK dependency.
+    Matches the existing pattern in main.py.
+    """
+    import httpx, base64, json, re, os, random
+    
+    # Gemini API Key Pool for rotation (to avoid credit exhaustion)
+    GEMINI_API_KEYS = [
+        os.getenv("GEMINI_API_KEY", ""),
+        "AIzaSyChEqBHLqPRrLWE_2YUiMs9vB-OlJ6y2vg",
+        "AIzaSyDFVrLaDOcWSpMEdT8WBA24ciEGy6CY5ms",
+        "AIzaSyButRsg2KpN4qNxv4YkbvU_N46jjNnLb78",
+        "AIzaSyCiNi2gVCuP1Ir28fu8p7YmfU4Xd28qa_A"
+    ]
+    # Filter out empty or placeholder keys
+    GEMINI_API_KEYS = [k.strip() for k in GEMINI_API_KEYS if k.strip() and k.strip().lower() != "your_gemini_api_key_here"]
+
+    def get_gemini_key():
+        if not GEMINI_API_KEYS:
+            return ""
+        return random.choice(GEMINI_API_KEYS)
+
+    # Build image parts for Gemini
+    image_parts = []
+    for png_bytes in page_images[:6]:  # max 6 pages
+        b64 = base64.b64encode(png_bytes).decode("utf-8")
+        image_parts.append({
+            "inline_data": {
+                "mime_type": "image/png",
+                "data": b64
+            }
+        })
+
+    # Add the extraction prompt as the final text part
+    image_parts.append({"text": GEMINI_VISION_PROMPT})
+
+    payload = {
+        "contents": [{"parts": image_parts}],
+        "generationConfig": {
+            "maxOutputTokens": 1024,
+            "temperature": 0.0,
+        }
+    }
+
+    # Try rotation for document extraction as well
+    for attempt in range(len(GEMINI_API_KEYS) if GEMINI_API_KEYS else 3):
+        try:
+            current_key = get_gemini_key()
+            if not current_key:
+                raise ValueError("No Gemini API key available")
+
+            GEMINI_URL = (
+                "https://generativelanguage.googleapis.com/v1beta"
+                "/models/gemini-2.0-flash:generateContent"
+                f"?key={current_key}"
+            )
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(GEMINI_URL, json=payload)
+                r.raise_for_status()
+                data = r.json()
+                
+            raw = (
+                data["candidates"][0]["content"]["parts"][0]["text"]
+                .strip()
+            )
+            # Strip markdown fences if present
+            raw = re.sub(r"```json|```", "", raw).strip()
+            result = json.loads(raw)
+
+            # Apply unit scaling immediately
+            scale = 1.0
+            unit = result.get("unit_scale", "unknown").lower()
+            if "lakh" in unit:
+                scale = 100_000
+            elif "crore" in unit:
+                scale = 10_000_000
+
+            numeric_fields = [
+                "revenue_from_operations", "total_revenue",
+                "ebitda", "profit_before_tax", "profit_after_tax",
+                "total_debt", "total_equity", "total_assets",
+                "current_assets", "current_liabilities",
+                "interest_expense", "depreciation",
+            ]
+            for field in numeric_fields:
+                if result.get(field) is not None:
+                    try:
+                        result[field] = float(result[field]) * scale
+                    except (ValueError, TypeError):
+                        pass
+
+            import logging
+            logger = logging.getLogger("intellicredit.document_ai")
+            logger.info(
+                "Gemini Vision OCR complete: unit=%s scale=%s "
+                "company=%s fy=%s",
+                unit, scale, result.get("company_name"), result.get("financial_year")
+            )
+            return result # Success!
+            
+        except Exception as e:
+            if attempt == (len(GEMINI_API_KEYS) - 1 if GEMINI_API_KEYS else 2):
+                import logging
+                logging.getLogger("intellicredit.document_ai").error(f"[GEMINI-VISION] All rotation attempts failed: {e}")
+                return {"error": "All Gemini vision rotation attempts failed", "details": str(e)}
+            import asyncio
+            await asyncio.sleep(1)
+
+    # Fallback return (should be unreachable)
+    return {"error": "Unknown failure in Gemini vision rotation"}
 
 
 # ─────────────────────────────────────────────────────────────────
